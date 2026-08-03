@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+Dependency injection for FastAPI
+"""
+
+from typing import Optional, Dict, Any
+from fastapi import Depends, HTTPException, status
+
+from ..config import Config
+from ..database import DatabaseManager
+from ..library.export_generator import ExportGenerator
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# Global instances
+_config: Optional[Config] = None
+_db: Optional[DatabaseManager] = None
+_export_generator: Optional[ExportGenerator] = None
+
+# Sync state
+_sync_in_progress: bool = False
+_sync_progress: Dict[str, Any] = {}
+
+
+def init_dependencies(config: Config, db: DatabaseManager):
+    """
+    Initialize global dependencies
+
+    Args:
+        config: Application configuration
+        db: Database manager instance (shared)
+    """
+    global _config, _db, _export_generator
+
+    _config = config
+    _db = db
+
+    # Initialize export generator with shared DB
+    _export_generator = ExportGenerator(_db, _config)
+
+    logger.info("Dependencies initialized with shared database connection")
+
+
+def get_config() -> Config:
+    """Get config dependency"""
+    if _config is None:
+        raise RuntimeError("Config not initialized")
+    return _config
+
+
+def get_db() -> DatabaseManager:
+    """Get database manager dependency"""
+    if _db is None:
+        raise RuntimeError("Database not initialized")
+    return _db
+
+
+def get_export_generator() -> ExportGenerator:
+    """Get export generator dependency"""
+    if _export_generator is None:
+        raise RuntimeError("Export generator not initialized")
+    return _export_generator
+
+
+def set_sync_state(in_progress: bool, progress: Optional[Dict[str, Any]] = None):
+    """Update sync state"""
+    global _sync_in_progress, _sync_progress
+    _sync_in_progress = in_progress
+    if progress is not None:
+        _sync_progress = progress
+    elif not in_progress:
+        _sync_progress = {}
+
+
+def get_sync_state() -> Dict[str, Any]:
+    """Get current sync state"""
+    return {
+        "sync_in_progress": _sync_in_progress,
+        "sync_progress": _sync_progress,
+    }

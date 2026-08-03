@@ -1,0 +1,42 @@
+# Backend connection
+backend:
+  url: "http://ultimate-backend:7777"
+  timeout: 30
+
+# Library output directory (for .strm files)
+library:
+  path: "/srv/vod-library"
+  movies_dir: "Movies"
+  tv_shows_dir: "TV Shows"
+  sports_dir: "Sports"
+
+# API server
+api:
+  host: "0.0.0.0"
+  port: 7888
+
+# Provider priority (highest first)
+provider_priority:
+  - "magenta2"
+  - "rtlplus"
+  - "joyn"
+  - "discovery_de"
+
+# Crawling settings
+crawler:
+  schedule: "0 3 * * *"  # 3 AM daily
+  concurrency: 2
+  page_size: 50
+  max_depth: 10
+  skip_highlights: true
+
+# Metadata settings
+metadata:
+  use_kodi_scrapers: true
+  embed_metadata: false
+  generate_nfo: true
+
+# Logging
+logging:
+  level: "INFO"
+  file: "/var/log/vod-crawler/crawler.log"

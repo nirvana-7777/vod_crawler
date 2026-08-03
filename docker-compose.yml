@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  vod-crawler:
+    build: .
+    container_name: ultimate-vod-crawler
+    restart: unless-stopped
+    ports:
+      - "7888:7888"
+    volumes:
+      # Configuration
+      - ./config.yaml:/app/config.yaml:ro
+      # Library output (optional - if you want .strm files)
+      - /srv/vod-library:/srv/vod-library
+      # Logs
+      - ./logs:/var/log/vod-crawler
+    environment:
+      - TZ=Europe/Berlin
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7888/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
