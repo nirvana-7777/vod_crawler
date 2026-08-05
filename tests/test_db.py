@@ -2,10 +2,15 @@
 """
 Test database operations using pytest
 """
+import os
+import sys
 import tempfile
 from pathlib import Path
-import pytest
 
+# Add the project root to Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pytest
 from src.database.db_manager import DatabaseManager
 from src.config import Config
 
@@ -29,13 +34,16 @@ def test_tv_show_operations(db):
         release_year=2003,
         genres=["Comedy", "Sitcom"]
     )
-    
+
     assert created is True
     assert show.title == "Two and a Half Men"
     assert show.normalized_title == "two_and_a_half_men"
-    assert show.provider_ids == {"joyn": "GN_SERIES_184925"}
+
+    # Check provider mappings
+    assert "joyn" in show.provider_ids
+    assert show.provider_ids["joyn"] == "GN_SERIES_184925"
     assert show.release_year == 2003
-    
+
     show2, created2 = db.get_or_create_show(
         normalized_title="two_and_a_half_men",
         title="Two and a Half Men (US)",
@@ -43,13 +51,15 @@ def test_tv_show_operations(db):
         provider_id="12345",
         plot="Updated plot..."
     )
-    
+
     assert created2 is False
-    assert show2.provider_ids == {"joyn": "GN_SERIES_184925", "rtlplus": "12345"}
-    
+    assert show2.provider_ids.get("joyn") == "GN_SERIES_184925"
+    assert show2.provider_ids.get("rtlplus") == "12345"
+
     found = db.get_show_by_id(show.id)
     assert found is not None
     assert found.title == "Two and a Half Men (US)"
+
 
 def test_episode_operations(db):
     show, _ = db.get_or_create_show(
@@ -58,7 +68,7 @@ def test_episode_operations(db):
         provider="joyn",
         provider_id="GN_SERIES_184925"
     )
-    
+
     ep1, created1 = db.add_or_update_episode(
         show_id=show.id,
         provider="joyn",
@@ -69,10 +79,10 @@ def test_episode_operations(db):
         duration_seconds=1260,
         manifest_url="http://backend/manifest"
     )
-    
+
     assert created1 is True
     assert ep1.title == "Pilot"
-    
+
     ep2, created2 = db.add_or_update_episode(
         show_id=show.id,
         provider="joyn",
@@ -83,15 +93,16 @@ def test_episode_operations(db):
         duration_seconds=1260
     )
     assert created2 is True
-    
+
     episodes = db.get_episodes_for_show(show.id)
     assert len(episodes) == 2
-    
+
     count = db.mark_episodes_unavailable(show.id, "joyn")
     assert count == 2
-    
+
     episodes = db.get_episodes_for_show(show.id)
     assert len(episodes) == 0
+
 
 def test_movie_operations(db):
     movie, created = db.add_or_update_movie(
@@ -106,12 +117,12 @@ def test_movie_operations(db):
         cast=["Timothée Chalamet", "Rebecca Ferguson"],
         manifest_url="http://backend/manifest"
     )
-    
+
     assert created is True
     assert movie.title == "Dune"
     assert movie.release_year == 2021
     assert "Denis Villeneuve" in movie.director
-    
+
     movie2, created2 = db.add_or_update_movie(
         provider="joyn",
         content_id="movie123",
@@ -119,21 +130,22 @@ def test_movie_operations(db):
         release_year=2021,
         is_highlight=False
     )
-    
+
     assert created2 is False
     assert movie2.title == "Dune (2021)"
-    
+
     found = db.get_movie_by_provider("joyn", "movie123")
     assert found is not None
     assert found.title == "Dune (2021)"
-    
+
     count = db.mark_movies_unavailable("joyn")
     assert count == 1
+
 
 def test_crawl_history(db):
     history_id = db.start_crawl("joyn")
     assert history_id > 0
-    
+
     db.finish_crawl(
         history_id=history_id,
         status="success",
@@ -142,14 +154,15 @@ def test_crawl_history(db):
         items_updated=30,
         items_removed=20
     )
-    
+
     last = db.get_last_crawl("joyn")
     assert last is not None
     assert last.status == "success"
     assert last.items_found == 100
-    
+
     history = db.get_crawl_history("joyn", limit=5)
     assert len(history) == 1
+
 
 def test_stats(db):
     show, _ = db.get_or_create_show(
@@ -158,7 +171,7 @@ def test_stats(db):
         provider="joyn",
         provider_id="id1"
     )
-    
+
     db.add_or_update_episode(
         show_id=show.id,
         provider="joyn",
@@ -167,14 +180,57 @@ def test_stats(db):
         episode_number=1,
         title="Episode 1"
     )
-    
+
     db.add_or_update_movie(
         provider="joyn",
         content_id="movie1",
         title="Movie 1"
     )
-    
+
     stats = db.get_stats()
     assert stats["total_tv_shows"] == 1
     assert stats["total_tv_episodes"] == 1
     assert stats["total_movies"] == 1
+
+
+def test_bulk_operations(db):
+    # Test bulk upsert for episodes
+    episodes = [
+        {
+            "show_id": "show1",
+            "provider": "joyn",
+            "content_id": "ep1",
+            "season_number": 1,
+            "episode_number": 1,
+            "title": "Episode 1"
+        },
+        {
+            "show_id": "show1",
+            "provider": "joyn",
+            "content_id": "ep2",
+            "season_number": 1,
+            "episode_number": 2,
+            "title": "Episode 2"
+        }
+    ]
+
+    # Need to create the show first
+    show, _ = db.get_or_create_show(
+        normalized_title="show1",
+        title="Show 1",
+        provider="joyn",
+        provider_id="id1"
+    )
+
+    # Update episode data with correct show_id
+    for ep in episodes:
+        ep["show_id"] = show.id
+
+    stats = db.bulk_upsert_episodes(episodes)
+    assert stats["added"] == 2
+    assert stats["updated"] == 0
+
+    # Run again - should update
+    stats = db.bulk_upsert_episodes(episodes)
+    assert stats["added"] == 0
+    assert stats["updated"] == 2

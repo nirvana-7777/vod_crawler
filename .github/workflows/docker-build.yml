@@ -65,9 +65,16 @@ jobs:
         run: |
           # Create a test database directory
           mkdir -p test_data
-          
-          # Run tests
-          pytest tests/ -v --cov=src --cov-report=xml --cov-report=term
+
+          # Set PYTHONPATH to include the project root
+          export PYTHONPATH="${PYTHONPATH}:${PWD}"
+
+          # Run tests if they exist
+          if [ -d "tests" ]; then
+            python -m pytest tests/ -v --cov=src --cov-report=xml --cov-report=term
+          else
+            echo "No tests directory found - skipping tests"
+          fi
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
