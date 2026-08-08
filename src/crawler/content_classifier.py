@@ -46,7 +46,11 @@ class ContentClassifier:
             ClassificationResult or None if item should be skipped
         """
         # Check if this is a category or item
-        content_type = item.get("content_type", "VOD").upper()
+        # NOTE: the backend sends this under "type" (e.g. "vod_category"),
+        # not "content_type". Keep "content_type" as a fallback in case
+        # another provider integration uses that key instead.
+        raw_type = item.get("type") or item.get("content_type", "VOD")
+        content_type = raw_type.upper()
 
         # Check if it's a playable item
         is_playable = item.get("is_playable", False)
@@ -56,7 +60,11 @@ class ContentClassifier:
             return None
 
         # Check if it's a category
-        is_category = item.get("is_category", False) or content_type == "CATEGORY"
+        is_category = (
+            item.get("is_category", False)
+            or content_type == "CATEGORY"
+            or content_type == "VOD_CATEGORY"
+        )
         if is_category or content_type == "FOLDER":
             return ClassificationResult(
                 content_type=ContentType.CATEGORY,
