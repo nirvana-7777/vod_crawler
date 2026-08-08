@@ -109,8 +109,23 @@ class TreeTraverser:
                     logger.warning(f"Category has no ID: {entry.get('name', 'unknown')}")
                     continue
 
-                # IMPORTANT: Use fetch_url if available (preserves query params)
+                # IMPORTANT: fetch_url is only safe to call directly when it
+                # points back at OUR OWN backend. For some providers (e.g.
+                # Magenta2) the backend surfaces the raw upstream provider
+                # URL here (tvhubs.t-online.de) purely as debug metadata --
+                # that's a different host with a completely different JSON
+                # shape, so calling it directly returns either a 404 (no
+                # auth/session) or a 200 with no "entries" key at all,
+                # which silently yields zero children with no error logged.
+                # Only use fetch_url when it's rooted at our own backend;
+                # otherwise always fall back to the content_id-based call.
                 fetch_url = entry.get("fetch_url")
+                if fetch_url and not fetch_url.startswith(self.crawler.base_url):
+                    logger.debug(
+                        f"Ignoring non-backend fetch_url for {entry.get('name', content_id)}: "
+                        f"{fetch_url!r} (using content_id instead)"
+                    )
+                    fetch_url = None
 
                 # Some categories are app deep-links (e.g. "app") rather than
                 # real URLs -- e.g. Magenta2's JOYN/Paramount+ tiles. Skip

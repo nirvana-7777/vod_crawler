@@ -218,7 +218,8 @@ class ProviderCrawler:
                 if len(self.episode_buffer) >= self.buffer_size:
                     self._flush_episodes()
 
-    def _extract_metadata(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _extract_metadata(entry: Dict[str, Any]) -> Dict[str, Any]:
         """Extract metadata from VodItem for database storage"""
         return {
             # Core metadata
@@ -329,7 +330,8 @@ class ProviderCrawler:
 
         return show
 
-    def _normalize_series_title(self, title: str) -> str:
+    @staticmethod
+    def _normalize_series_title(title: str) -> str:
         """Normalize series title for matching across providers"""
         import re
 
