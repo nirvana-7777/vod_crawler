@@ -67,6 +67,17 @@ class TreeTraverser:
         # BFS queue: (entry, depth, parent_content_id)
         queue = deque()
 
+        # Track category content_ids we've already fetched children for.
+        # Some providers' catalogs are a graph, not a tree -- the same
+        # series/season/lane can be reachable from multiple parent lanes
+        # (e.g. Magenta2's overlapping recommendation lanes). Without this,
+        # the same node gets fetched and its items fully reprocessed once
+        # per path that leads to it, which both wastes requests and can
+        # cause duplicate-insert failures downstream (e.g. show_providers
+        # unique constraint on (provider, provider_id)).
+        visited_category_ids = set()
+        visited_item_ids = set()
+
         # Start with root
         root_response = self.crawler.get_vod_root(provider)
         if not root_response:
@@ -108,6 +119,11 @@ class TreeTraverser:
                 if not content_id:
                     logger.warning(f"Category has no ID: {entry.get('name', 'unknown')}")
                     continue
+
+                if content_id in visited_category_ids:
+                    logger.debug(f"Skipping already-visited category: {content_id}")
+                    continue
+                visited_category_ids.add(content_id)
 
                 # IMPORTANT: fetch_url is only safe to call directly when it
                 # points back at OUR OWN backend. For some providers (e.g.
@@ -178,6 +194,11 @@ class TreeTraverser:
 
             elif result.content_type == ContentType.MOVIE:
                 # Process movie
+                item_id = entry.get("id") or entry.get("Id")
+                if item_id and item_id in visited_item_ids:
+                    continue
+                if item_id:
+                    visited_item_ids.add(item_id)
                 stats["total_items"] += 1
                 stats["movies"] += 1
                 if on_item:
@@ -185,6 +206,11 @@ class TreeTraverser:
 
             elif result.content_type == ContentType.TV_EPISODE:
                 # Process TV episode
+                item_id = entry.get("id") or entry.get("Id")
+                if item_id and item_id in visited_item_ids:
+                    continue
+                if item_id:
+                    visited_item_ids.add(item_id)
                 stats["total_items"] += 1
                 stats["episodes"] += 1
                 if on_item:

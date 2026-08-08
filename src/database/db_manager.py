@@ -95,11 +95,32 @@ class DatabaseManager:
         self._validate_provider(provider)
 
         with self.session() as session:
-            show = session.query(TVShow).options(
-                joinedload(TVShow.provider_mappings)
-            ).filter_by(
-                normalized_title=normalized_title
-            ).first()
+            # Look up by (provider, provider_id) FIRST. This is the
+            # authoritative identity for "have we already seen this exact
+            # season/series from this provider" -- normalized_title alone
+            # is not reliable because the same show can arrive with subtly
+            # different title text across different lanes/categories (extra
+            # whitespace, promo suffixes, etc.), which would otherwise
+            # produce two different TVShow rows for what is really one show,
+            # and the second one's ShowProvider insert then collides on the
+            # (provider, provider_id) unique constraint.
+            show = None
+            if provider_id:
+                existing_mapping = session.query(ShowProvider).filter_by(
+                    provider=provider,
+                    provider_id=provider_id
+                ).first()
+                if existing_mapping:
+                    show = session.query(TVShow).options(
+                        joinedload(TVShow.provider_mappings)
+                    ).filter_by(id=existing_mapping.show_id).first()
+
+            if show is None:
+                show = session.query(TVShow).options(
+                    joinedload(TVShow.provider_mappings)
+                ).filter_by(
+                    normalized_title=normalized_title
+                ).first()
 
             if show:
                 show.title = title
@@ -131,7 +152,27 @@ class DatabaseManager:
                     if key in kwargs and kwargs[key]:
                         setattr(show, key, kwargs[key])
 
-                session.commit()
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # Defensive fallback: another concurrent/duplicate path
+                    # already inserted this exact (provider, provider_id)
+                    # mapping between our lookup and our commit. Roll back
+                    # our attempt and just return the row that won.
+                    session.rollback()
+                    logger.warning(
+                        f"Race on show_providers ({provider}, {provider_id}); "
+                        f"using the row that was already committed"
+                    )
+                    winner_mapping = session.query(ShowProvider).filter_by(
+                        provider=provider,
+                        provider_id=provider_id
+                    ).first()
+                    winner_show = session.query(TVShow).options(
+                        joinedload(TVShow.provider_mappings)
+                    ).filter_by(id=winner_mapping.show_id).first()
+                    return winner_show, False
+
                 return show, False
             else:
                 show_id = slugify(normalized_title) or str(uuid.uuid4())
@@ -164,7 +205,27 @@ class DatabaseManager:
                 )
                 show.provider_mappings.append(mapping)
 
-                session.commit()
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # Same race as above, but on the create path: someone
+                    # else committed this (provider, provider_id) mapping
+                    # between our lookup and our insert. Discard our new
+                    # (now orphaned) show row and use the winner instead.
+                    session.rollback()
+                    logger.warning(
+                        f"Race creating show for ({provider}, {provider_id}); "
+                        f"using the row that was already committed"
+                    )
+                    winner_mapping = session.query(ShowProvider).filter_by(
+                        provider=provider,
+                        provider_id=provider_id
+                    ).first()
+                    winner_show = session.query(TVShow).options(
+                        joinedload(TVShow.provider_mappings)
+                    ).filter_by(id=winner_mapping.show_id).first()
+                    return winner_show, False
+
                 return show, True
 
     def get_show_by_id(self, show_id: str) -> Optional[TVShow]:

@@ -211,6 +211,7 @@ class ProviderCrawler:
                     "episode_number": result.episode_number or 0,
                     "title": name,
                     "series_title": result.series_title or name,
+                    "provider_episode_id": content_id,
                     **metadata
                 }
                 self.episode_buffer.append(episode_data)
@@ -267,9 +268,6 @@ class ProviderCrawler:
             # Promotional
             "trailer_url": entry.get("trailer_url"),
             "is_highlight": entry.get("is_highlight", False),
-
-            # Provider-specific
-            "provider_episode_id": entry.get("id") or entry.get("Id"),
 
             # External IDs (if available)
             "imdb_id": entry.get("imdb_id"),
