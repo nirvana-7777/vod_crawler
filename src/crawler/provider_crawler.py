@@ -203,6 +203,18 @@ class ProviderCrawler:
 
             if show:
                 # Add to episode buffer
+                # NOTE: these keys exist in `metadata` (shared with movies)
+                # but have no corresponding column on TVEpisode -- movies
+                # have their own release_year/original_title/imdb_id/tmdb_id,
+                # episodes don't. Passing them through makes
+                # bulk_upsert_episodes()'s raw insert(...).values(**ep_data)
+                # blow up with "Unconsumed column names" since it doesn't
+                # filter unknown keys the way add_or_update_episode()'s
+                # explicit whitelist does.
+                episode_only_metadata = {
+                    k: v for k, v in metadata.items()
+                    if k not in ("original_title", "release_year", "imdb_id", "tmdb_id")
+                }
                 episode_data = {
                     "show_id": show.id,
                     "provider": provider,
@@ -211,8 +223,7 @@ class ProviderCrawler:
                     "episode_number": result.episode_number or 0,
                     "title": name,
                     "series_title": result.series_title or name,
-                    "provider_episode_id": content_id,
-                    **metadata
+                    **episode_only_metadata
                 }
                 self.episode_buffer.append(episode_data)
 
@@ -247,9 +258,9 @@ class ProviderCrawler:
             "session_manifest": entry.get("session_manifest", entry.get("SessionManifest", False)),
 
             # DRM
-            "license_url": entry.get("license_url"),
-            "certificate_url": entry.get("certificate_url"),
-            "drm_config": entry.get("drm_config"),
+            "license_url": entry.get("license_url") or entry.get("LicenseUrl"),
+            "certificate_url": entry.get("certificate_url") or entry.get("CertificateUrl"),
+            "drm_config": entry.get("drm_config") or entry.get("DrmConfig"),
             "cdm_type": entry.get("cdm_type") or entry.get("CdmType"),
             "use_cdm": entry.get("use_cdm", entry.get("UseCdm", True)),
             "cdm_mode": entry.get("cdm_mode") or entry.get("CdmMode", "external"),
@@ -262,7 +273,7 @@ class ProviderCrawler:
             "quality": entry.get("quality") or entry.get("Quality"),
 
             # Localization
-            "language": entry.get("language", "de"),
+            "language": entry.get("language") or entry.get("Language", "de"),
             "country": entry.get("country") or entry.get("Country", "DE"),
 
             # Promotional
