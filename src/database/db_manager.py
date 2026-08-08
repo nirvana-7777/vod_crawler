@@ -296,15 +296,20 @@ class DatabaseManager:
     ) -> Tuple[TVEpisode, bool]:
         self._validate_provider(provider)
         with self.session() as session:
+            # Identity is (provider, content_id) -- NOT (show_id, provider,
+            # season_number, episode_number). Season/episode numbers are
+            # data, not identity: multiple distinct episodes can legitimately
+            # both lack real values and default to (0, 0), and that must not
+            # make them collide.
             episode = session.query(TVEpisode).filter_by(
-                show_id=show_id,
                 provider=provider,
-                season_number=season_number,
-                episode_number=episode_number
+                content_id=content_id
             ).first()
 
             if episode:
-                episode.content_id = content_id
+                episode.show_id = show_id
+                episode.season_number = season_number
+                episode.episode_number = episode_number
                 episode.last_seen = datetime.now(timezone.utc)
                 episode.is_available = True
 
@@ -356,25 +361,25 @@ class DatabaseManager:
         if not episodes:
             return stats
 
-        # Fields that should not be overwritten during an update
-        immutable_fields = {'show_id', 'provider', 'season_number', 'episode_number', 'id', 'first_seen'}
+        # Identity is (provider, content_id) -- matches the uq_episode_provider_content
+        # constraint. season_number/episode_number are data, not identity:
+        # distinct episodes can legitimately share (0, 0) when a provider
+        # doesn't supply real values, and content_id is what actually
+        # disambiguates them.
+        immutable_fields = {'provider', 'content_id', 'id', 'first_seen'}
 
         with self.session() as session:
             # Determine which rows already exist for accurate stats
-            keys = [(e['show_id'], e['provider'], e['season_number'], e['episode_number']) for e in episodes]
+            keys = [(e['provider'], e['content_id']) for e in episodes]
             existing = set()
             if keys:
-                # Use tuple_ for composite key lookup
-                from sqlalchemy import and_
-                for show_id, provider, season, episode_num in keys:
+                for provider, content_id in keys:
                     exists_query = session.query(TVEpisode.id).filter(
-                        TVEpisode.show_id == show_id,
                         TVEpisode.provider == provider,
-                        TVEpisode.season_number == season,
-                        TVEpisode.episode_number == episode_num
+                        TVEpisode.content_id == content_id
                     ).first()
                     if exists_query:
-                        existing.add((show_id, provider, season, episode_num))
+                        existing.add((provider, content_id))
 
             for ep_data in episodes:
                 self._validate_provider(ep_data['provider'])
@@ -393,14 +398,13 @@ class DatabaseManager:
 
                 stmt = insert(TVEpisode).values(**ep_data)
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=['show_id', 'provider', 'season_number', 'episode_number'],
+                    index_elements=['provider', 'content_id'],
                     set_=update_set
                 )
                 session.execute(stmt)
 
                 # Accurate stats using pre-checked existing rows
-                key = (ep_data['show_id'], ep_data['provider'],
-                       ep_data['season_number'], ep_data['episode_number'])
+                key = (ep_data['provider'], ep_data['content_id'])
                 if key in existing:
                     stats["updated"] += 1
                 else:

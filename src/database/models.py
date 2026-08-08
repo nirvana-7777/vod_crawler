@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any
 
 from sqlalchemy import (
-    Column, String, Integer, DateTime, Boolean, Text, 
+    Column, String, Integer, DateTime, Boolean, Text,
     ForeignKey, Index, JSON, UniqueConstraint
 )
 from sqlalchemy.orm import declarative_base, relationship
@@ -23,9 +23,10 @@ class ShowProvider(Base):
     show_id = Column(String(255), ForeignKey("tv_shows.id", ondelete="CASCADE"), primary_key=True)
     provider = Column(String(100), primary_key=True)
     provider_id = Column(String(255), nullable=False)
-    
+
     first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                       onupdate=lambda: datetime.now(timezone.utc))
     is_available = Column(Boolean, default=True)
 
     show = relationship("TVShow", back_populates="provider_mappings")
@@ -57,9 +58,10 @@ class TVShow(Base):
     imdb_id = Column(String(50), nullable=True)
     tmdb_id = Column(String(50), nullable=True)
     tvdb_id = Column(String(50), nullable=True)
-    
+
     first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                       onupdate=lambda: datetime.now(timezone.utc))
     is_available = Column(Boolean, default=True)
 
     episodes = relationship("TVEpisode", back_populates="show", cascade="all, delete-orphan")
@@ -100,14 +102,14 @@ class TVEpisode(Base):
 
     id = Column(String(255), primary_key=True, default=lambda: str(uuid.uuid4()))
     show_id = Column(String(255), ForeignKey("tv_shows.id", ondelete="CASCADE"), nullable=False, index=True)
-    
+
     provider = Column(String(100), nullable=False)
     content_id = Column(String(255), nullable=False)
     season_number = Column(Integer, nullable=False)
     episode_number = Column(Integer, nullable=False)
     title = Column(String(500), nullable=True)  # Maps to backend 'name'
     series_title = Column(String(500), nullable=True)  # Backend expects this on the item
-    
+
     # Metadata
     plot = Column(Text, nullable=True)  # Maps to backend 'description'
     long_description = Column(Text, nullable=True)
@@ -118,14 +120,14 @@ class TVEpisode(Base):
     genre = Column(String(255), nullable=True)
     cast = Column(JSON, nullable=True)
     director = Column(String(255), nullable=True)
-    
+
     # Streaming Configuration (Matches backend Content/VodItem)
     mode = Column(String(20), default="vod")
     logo_url = Column(String(1000), nullable=True)
     manifest_url = Column(String(1000), nullable=True)
     manifest_script = Column(Text, nullable=True)  # For dynamic manifests
     session_manifest = Column(Boolean, default=False)
-    
+
     # DRM / CDM
     license_url = Column(String(1000), nullable=True)
     certificate_url = Column(String(1000), nullable=True)
@@ -133,32 +135,33 @@ class TVEpisode(Base):
     cdm_type = Column(String(50), nullable=True)
     use_cdm = Column(Boolean, default=True)
     cdm_mode = Column(String(50), default="external")
-    
+
     # Video settings
     video = Column(String(50), default="best")
     on_demand = Column(Boolean, default=True)
     speed_up = Column(Boolean, default=True)
     streaming_format = Column(String(50), nullable=True)
     quality = Column(String(50), nullable=True)
-    
+
     # Localization
     language = Column(String(10), default="de")
     country = Column(String(10), default="DE")
-    
+
     # Promotional
     trailer_url = Column(String(1000), nullable=True)
     is_highlight = Column(Boolean, default=False)
-    
+
     # Status
     first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                       onupdate=lambda: datetime.now(timezone.utc))
     is_available = Column(Boolean, default=True)
 
     show = relationship("TVShow", back_populates="episodes")
 
     __table_args__ = (
-        UniqueConstraint("show_id", "season_number", "episode_number", "provider", 
-                        name="uq_episode_provider"),
+        UniqueConstraint("provider", "content_id",
+                         name="uq_episode_provider_content"),
         Index("idx_episodes_show_provider", "show_id", "provider"),
         Index("idx_episodes_season_episode", "show_id", "season_number", "episode_number"),
         Index("idx_episodes_available", "is_available"),
@@ -220,7 +223,7 @@ class Movie(Base):
     id = Column(String(512), primary_key=True)  # provider:content_id combination
     provider = Column(String(100), nullable=False, index=True)
     content_id = Column(String(255), nullable=False)
-    
+
     # Metadata
     title = Column(String(500), nullable=False)  # Maps to backend 'name'
     original_title = Column(String(500), nullable=True)
@@ -233,18 +236,18 @@ class Movie(Base):
     genre = Column(String(255), nullable=True)  # Primary genre
     cast = Column(JSON, nullable=True)
     director = Column(String(255), nullable=True)
-    
+
     # External IDs
     imdb_id = Column(String(50), nullable=True)
     tmdb_id = Column(String(50), nullable=True)
-    
+
     # Streaming Configuration (Matches backend Content/VodItem)
     mode = Column(String(20), default="vod")
     logo_url = Column(String(1000), nullable=True)
     manifest_url = Column(String(1000), nullable=True)
     manifest_script = Column(Text, nullable=True)  # For dynamic manifests
     session_manifest = Column(Boolean, default=False)
-    
+
     # DRM / CDM
     license_url = Column(String(1000), nullable=True)
     certificate_url = Column(String(1000), nullable=True)
@@ -252,28 +255,29 @@ class Movie(Base):
     cdm_type = Column(String(50), nullable=True)
     use_cdm = Column(Boolean, default=True)
     cdm_mode = Column(String(50), default="external")
-    
+
     # Video settings
     video = Column(String(50), default="best")
     on_demand = Column(Boolean, default=True)
     speed_up = Column(Boolean, default=True)
     streaming_format = Column(String(50), nullable=True)
     quality = Column(String(50), nullable=True)
-    
+
     # Localization
     language = Column(String(10), default="de")
     country = Column(String(10), default="DE")
-    
+
     # Promotional
     trailer_url = Column(String(1000), nullable=True)
-    
+
     # Classification
     is_highlight = Column(Boolean, default=False)
     is_sport = Column(Boolean, default=False)
-    
+
     # Status
     first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                       onupdate=lambda: datetime.now(timezone.utc))
     is_available = Column(Boolean, default=True)
 
     __table_args__ = (
@@ -340,12 +344,12 @@ class CrawlHistory(Base):
     provider = Column(String(100), nullable=False, index=True)
     crawl_start = Column(DateTime, nullable=False)
     crawl_end = Column(DateTime, nullable=True)
-    
+
     items_found = Column(Integer, default=0)
     items_added = Column(Integer, default=0)
     items_removed = Column(Integer, default=0)
     items_updated = Column(Integer, default=0)
-    
+
     status = Column(String(50), default="running")
     error_message = Column(Text, nullable=True)
     details = Column(JSON, nullable=True)
@@ -382,16 +386,17 @@ class VodCache(Base):
     provider = Column(String(100), nullable=False, index=True)
     content_id = Column(String(255), nullable=False)
     content_type = Column(String(50), nullable=False)
-    
+
     raw_data = Column(JSON, nullable=False)
     hash = Column(String(64), nullable=True)
-    
+
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
-        UniqueConstraint("provider", "content_id", "content_type", 
-                        name="uq_vod_cache_provider_content_type"),
+        UniqueConstraint("provider", "content_id", "content_type",
+                         name="uq_vod_cache_provider_content_type"),
         Index("idx_vod_cache_provider_type", "provider", "content_type"),
         Index("idx_vod_cache_hash", "hash"),
     )
