@@ -45,15 +45,16 @@ class ContentClassifier:
         Returns:
             ClassificationResult or None if item should be skipped
         """
-        # Check if this is a category or item
-        # NOTE: the backend sends this under "type" (e.g. "vod_category"),
-        # not "content_type". Keep "content_type" as a fallback in case
-        # another provider integration uses that key instead.
-        raw_type = item.get("type") or item.get("content_type", "VOD")
+        # Check if this is a category or item.
+        # NOTE: the backend's field naming is inconsistent between levels:
+        #   - category entries use lowercase "type" (e.g. "vod_category")
+        #   - leaf item entries use lowercase "type": "vod" (generic/useless)
+        #     PLUS a separate PascalCase "ContentType": "MOVIE" key that is
+        #     the actual authoritative signal for items.
+        # So: check the lowercase "type" first for the category case, then
+        # fall back to ContentType/content_type for the item case.
+        raw_type = item.get("type", "VOD")
         content_type = raw_type.upper()
-
-        # Check if it's a playable item
-        is_playable = item.get("is_playable", False)
 
         # Skip highlights if configured
         if self.skip_highlights and item.get("is_highlight", False):
@@ -71,8 +72,25 @@ class ContentClassifier:
                 is_playable=False
             )
 
+        # There is no explicit "is_playable" flag anywhere in the backend
+        # payload -- infer playability from the presence of a stream/manifest
+        # URL instead.
+        is_playable = bool(
+            item.get("is_playable")
+            or item.get("stream_url")
+            or item.get("manifest_url")
+        )
+
+        # Item-level content type lives under PascalCase "ContentType" (the
+        # lowercase "type" is just "vod" for every playable item and isn't
+        # useful here). Fall back to lowercase "content_type" in case some
+        # provider integration normalizes it differently.
+        item_content_type = (
+            item.get("ContentType") or item.get("content_type") or ""
+        ).upper()
+
         # CRITICAL FIX: MOVIE should short-circuit regardless of stray season/episode fields
-        if content_type == "MOVIE":
+        if item_content_type == "MOVIE":
             return ClassificationResult(
                 content_type=ContentType.MOVIE,
                 is_playable=is_playable
@@ -91,19 +109,19 @@ class ContentClassifier:
             return ClassificationResult(
                 content_type=ContentType.TV_EPISODE,
                 is_playable=is_playable,
-                series_title=series_title or item.get("name"),
-                series_id=series_id or item.get("id"),
+                series_title=series_title or item.get("name") or item.get("Name"),
+                series_id=series_id,
                 season_number=season_number,
                 episode_number=episode_number
             )
 
         # Check for series title as a fallback (some providers mark episodes differently)
-        if series_title and (content_type == "VOD" or content_type == "EPISODE"):
+        if series_title and (item_content_type in ("", "VOD", "EPISODE")):
             return ClassificationResult(
                 content_type=ContentType.TV_EPISODE,
                 is_playable=is_playable,
                 series_title=series_title,
-                series_id=series_id or item.get("id"),
+                series_id=series_id,
                 season_number=season_number,
                 episode_number=episode_number
             )

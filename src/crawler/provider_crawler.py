@@ -149,17 +149,31 @@ class ProviderCrawler:
 
         self.stats["categories_processed"] = self.stats.get("categories_processed", 0) + 1
 
-    def _process_item(self, entry: Dict[str, Any], result: ClassificationResult) -> None:
-        """Process a VodItem (movie or TV episode)"""
+    def _process_item(self, entry: Dict[str, Any], result: ClassificationResult, parent_content_id: Optional[str] = None) -> None:
+        """Process a VodItem (movie or TV episode)
+
+        Args:
+            entry: raw item payload
+            result: classification result
+            parent_content_id: content_id of the category this item was
+                fetched under. Used as the series identifier fallback for
+                episodes -- some providers (e.g. RTL+) leave series_id null
+                on every clip and never expose a usable series id anywhere
+                on the item itself, only via the parent program/category id.
+        """
 
         # CRITICAL FIX: Skip non-playable items entirely
         if not result.is_playable:
             logger.debug(f"Skipping non-playable item: {entry.get('name', 'unknown')}")
             return
 
-        provider = entry.get("provider", "unknown")
-        content_id = entry.get("id", "")
-        name = entry.get("name", "Unknown")
+        # NOTE: leaf item entries only carry PascalCase "Id"/"Name"/"Provider"
+        # -- there are no lowercase equivalents in this backend's item
+        # payload (unlike category entries, which are all lowercase). Fall
+        # back accordingly or every item collapses to the same identity.
+        provider = entry.get("provider") or entry.get("Provider") or "unknown"
+        content_id = entry.get("id") or entry.get("Id") or ""
+        name = entry.get("name") or entry.get("Name") or "Unknown"
 
         # Build common metadata from entry
         metadata = self._extract_metadata(entry)
@@ -183,6 +197,7 @@ class ProviderCrawler:
                 provider=provider,
                 series_title=result.series_title or name,
                 series_id=result.series_id,
+                parent_content_id=parent_content_id,
                 entry=entry
             )
 
@@ -224,36 +239,36 @@ class ProviderCrawler:
 
             # Streaming
             "mode": "vod",
-            "logo_url": entry.get("logo_url"),
+            "logo_url": entry.get("logo_url") or entry.get("LogoUrl"),
             "manifest_url": entry.get("manifest_url"),
-            "manifest_script": entry.get("manifest_script"),
-            "session_manifest": entry.get("session_manifest", False),
+            "manifest_script": entry.get("manifest_script") or entry.get("ManifestScript"),
+            "session_manifest": entry.get("session_manifest", entry.get("SessionManifest", False)),
 
             # DRM
             "license_url": entry.get("license_url"),
             "certificate_url": entry.get("certificate_url"),
             "drm_config": entry.get("drm_config"),
-            "cdm_type": entry.get("cdm_type"),
-            "use_cdm": entry.get("use_cdm", True),
-            "cdm_mode": entry.get("cdm_mode", "external"),
+            "cdm_type": entry.get("cdm_type") or entry.get("CdmType"),
+            "use_cdm": entry.get("use_cdm", entry.get("UseCdm", True)),
+            "cdm_mode": entry.get("cdm_mode") or entry.get("CdmMode", "external"),
 
             # Video settings
-            "video": entry.get("video", "best"),
-            "on_demand": entry.get("on_demand", True),
-            "speed_up": entry.get("speed_up", True),
-            "streaming_format": entry.get("streaming_format"),
-            "quality": entry.get("quality"),
+            "video": entry.get("video") or entry.get("Video", "best"),
+            "on_demand": entry.get("on_demand", entry.get("OnDemand", True)),
+            "speed_up": entry.get("speed_up", entry.get("SpeedUp", True)),
+            "streaming_format": entry.get("streaming_format") or entry.get("StreamingFormat"),
+            "quality": entry.get("quality") or entry.get("Quality"),
 
             # Localization
             "language": entry.get("language", "de"),
-            "country": entry.get("country", "DE"),
+            "country": entry.get("country") or entry.get("Country", "DE"),
 
             # Promotional
             "trailer_url": entry.get("trailer_url"),
             "is_highlight": entry.get("is_highlight", False),
 
             # Provider-specific
-            "provider_episode_id": entry.get("id"),
+            "provider_episode_id": entry.get("id") or entry.get("Id"),
 
             # External IDs (if available)
             "imdb_id": entry.get("imdb_id"),
@@ -265,12 +280,19 @@ class ProviderCrawler:
             provider: str,
             series_title: str,
             series_id: Optional[str],
-            entry: Dict[str, Any]
+            entry: Dict[str, Any],
+            parent_content_id: Optional[str] = None,
     ) -> Optional[Any]:
         """
         Get or create a TV show for an episode.
         Delegates to DatabaseManager.get_or_create_show() which handles
         the session lifecycle correctly.
+
+        series_id (from classification) is often null at the item level
+        (e.g. RTL+ never populates it on the clip itself) -- prefer
+        parent_content_id, the content_id of the category/program folder
+        the episode was fetched under, which is the actual stable series
+        identifier in that case.
         """
         if not series_title:
             logger.warning(f"No series title for episode {entry.get('id', 'unknown')}")
@@ -282,11 +304,13 @@ class ProviderCrawler:
         # Get show metadata from entry
         show_metadata = {
             "plot": entry.get("description") or entry.get("long_description"),
-            "poster_url": entry.get("logo_url"),
+            "poster_url": entry.get("logo_url") or entry.get("LogoUrl"),
             "genres": entry.get("genres"),
             "genre": entry.get("genre"),
             "release_year": entry.get("release_year"),
         }
+
+        resolved_series_id = series_id or parent_content_id or ""
 
         # Let the DB manager handle the upsert!
         # This correctly handles both creation and updates with proper session management
@@ -294,7 +318,7 @@ class ProviderCrawler:
             normalized_title=normalized_title,
             title=series_title,
             provider=provider,
-            provider_id=series_id or "",
+            provider_id=resolved_series_id,
             **show_metadata
         )
 
