@@ -25,6 +25,7 @@ class ProviderCrawler:
         self.config = config
         self.db = db
         self.crawler = BaseCrawler(config)
+        self.current_provider: Optional[str] = None
         self.classifier = ContentClassifier(
             skip_highlights=config.crawler.skip_highlights
         )
@@ -61,6 +62,18 @@ class ProviderCrawler:
             Crawl statistics
         """
         logger.info(f"Starting crawl for provider: {provider}")
+
+        # Canonical provider identifier for this crawl -- this is what
+        # matches config.provider_priority, the API path we're calling,
+        # and what _validate_provider() checks against. Do NOT trust
+        # whatever an individual item's own "provider"/"Provider" field
+        # says instead: for plugin-backed multi-country providers (e.g.
+        # discovery_de, joyn_de/at/ch, magentaeu_hr/pl/me/at), the item
+        # payload reflects the underlying PLUGIN name ("discovery", "joyn",
+        # "magentaeu"), not the specific country-scoped instance we
+        # actually queried -- using it directly causes "Unknown provider"
+        # validation failures.
+        self.current_provider = provider
 
         # Start crawl history
         history_id = self.db.start_crawl(provider)
@@ -167,11 +180,18 @@ class ProviderCrawler:
             logger.debug(f"Skipping non-playable item: {entry.get('name', 'unknown')}")
             return
 
-        # NOTE: leaf item entries only carry PascalCase "Id"/"Name"/"Provider"
-        # -- there are no lowercase equivalents in this backend's item
-        # payload (unlike category entries, which are all lowercase). Fall
-        # back accordingly or every item collapses to the same identity.
-        provider = entry.get("provider") or entry.get("Provider") or "unknown"
+        # NOTE: leaf item entries only carry PascalCase "Id"/"Name" -- there
+        # are no lowercase equivalents in this backend's item payload (unlike
+        # category entries, which are all lowercase). Fall back accordingly
+        # or every item collapses to the same identity.
+        #
+        # Provider identity is DELIBERATELY not read from the entry at all:
+        # for plugin-backed multi-country providers, the item's own
+        # "provider"/"Provider" field reflects the underlying plugin name
+        # (e.g. "discovery" for discovery_de, "joyn" for joyn_de/at/ch),
+        # not the specific country-scoped instance we're crawling. Always
+        # use the canonical provider this crawl was started with instead.
+        provider = self.current_provider
         content_id = entry.get("id") or entry.get("Id") or ""
         name = entry.get("name") or entry.get("Name") or "Unknown"
 
