@@ -27,9 +27,18 @@ class ExportGenerator:
         self.plugin_id = "plugin.video.ultimate"
 
     def _build_plugin_url(self, action: str, **kwargs) -> str:
-        """Build a plugin:// URL for Kodi"""
-        params = urlencode(kwargs)
-        return f"plugin://{self.plugin_id}/?{params}"
+        """Build a plugin:// URL for Kodi.
+
+        The ``action`` parameter is required by the plugin.video.ultimate
+        Kodi addon so it knows which routing handler to invoke (e.g.
+        ``play_vod`` to fetch and resolve a video stream). It is placed
+        first in the query string for clarity and to match the addon's
+        expected URL shape.
+        """
+        if not action:
+            raise ValueError("plugin URL requires a non-empty 'action' parameter")
+        params = {"action": action, **kwargs}
+        return f"plugin://{self.plugin_id}/?{urlencode(params)}"
 
     def _get_item_hash(self, item: Dict[str, Any]) -> str:
         """Generate a hash for change detection"""
