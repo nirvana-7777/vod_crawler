@@ -15,8 +15,6 @@ from .models import (
     SyncRequest,
     SyncResponse,
     StatusResponse,
-    MovieExport,
-    EpisodeExport,
     ShowSummary,
     PaginatedMovies,
     PaginatedEpisodes,
