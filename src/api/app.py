@@ -90,7 +90,18 @@ def create_app(config: Config, db: DatabaseManager) -> FastAPI:
                 hours_since_crawl = None
                 last_crawl_iso = None
                 if last_crawl:
-                    hours_since_crawl = (utcnow() - last_crawl.crawl_start).total_seconds() / 3600
+                    # Convert naive datetime to aware if needed
+                    # SQLite stores datetimes as naive strings without timezone info
+                    # Our utcnow() returns aware datetimes, so we need to make the DB values aware too
+                    crawl_start = last_crawl.crawl_start
+                    if crawl_start.tzinfo is None:
+                        # The crawl_start is naive (from SQLite) - make it aware in UTC
+                        # SQLite stores datetimes in UTC if we always use utcnow() when inserting
+                        from datetime import timezone
+                        crawl_start = crawl_start.replace(tzinfo=timezone.utc)
+
+                    now = utcnow()
+                    hours_since_crawl = (now - crawl_start).total_seconds() / 3600
                     last_crawl_iso = last_crawl.crawl_start.isoformat()
 
             if hours_since_crawl is None or hours_since_crawl > _STALE_CRAWL_HOURS:
