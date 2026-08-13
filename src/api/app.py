@@ -95,7 +95,7 @@ def create_app(config: Config, db: DatabaseManager) -> FastAPI:
 
             if hours_since_crawl is None or hours_since_crawl > _STALE_CRAWL_HOURS:
                 return JSONResponse(
-                    status_code=503,
+                    status_code=200,
                     content={
                         "status": "degraded",
                         "database": "connected",

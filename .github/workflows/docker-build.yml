@@ -209,7 +209,7 @@ jobs:
           # Test health endpoint
           max_attempts=30
           attempt=0
-          until curl -f http://localhost:7888 || [ $attempt -eq $max_attempts ]; do
+          until curl -f http://localhost:7888/health || [ $attempt -eq $max_attempts ]; do
             attempt=$((attempt + 1))
             echo "Waiting for service to be ready... (attempt $attempt/$max_attempts)"
             sleep 2
