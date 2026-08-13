@@ -3,10 +3,10 @@
 FastAPI routes for VOD crawler API
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, List
 from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from sqlalchemy.orm import joinedload
 
@@ -18,9 +18,12 @@ from .models import (
     MovieExport,
     EpisodeExport,
     ShowSummary,
+    PaginatedMovies,
+    PaginatedEpisodes,
 )
-from .dependencies import get_db, get_export_generator, get_config, get_sync_state, set_sync_state
+from .dependencies import get_db, get_export_generator, get_config
 from ..database import DatabaseManager
+from ..database.models import TVEpisode, FREE_ACCESS_TYPES
 from ..library.export_generator import ExportGenerator
 from ..crawler import ProviderCrawler
 from ..config import Config
@@ -33,12 +36,13 @@ router = APIRouter(prefix="/api", tags=["library"])
 
 @router.get("/status", response_model=StatusResponse)
 async def get_status(
+    db: DatabaseManager = Depends(get_db),
     export_generator: ExportGenerator = Depends(get_export_generator),
 ):
     """Get crawler status"""
     status = export_generator.get_status()
 
-    sync_state = get_sync_state()
+    sync_state = db.get_sync_state()
     status["sync_in_progress"] = sync_state["sync_in_progress"]
     status["sync_progress"] = sync_state["sync_progress"]
 
@@ -49,6 +53,7 @@ async def get_status(
 async def export_library(
     since: Optional[str] = Query(None, description="ISO 8601 timestamp for incremental updates"),
     providers: Optional[str] = Query(None, description="Comma-separated list of providers"),
+    include_priced: bool = Query(False, description="Include priced (rent/buy/subscription) content; default only free/unknown-priced content"),
     export_generator: ExportGenerator = Depends(get_export_generator),
 ):
     """Export the complete library"""
@@ -66,6 +71,7 @@ async def export_library(
     data = export_generator.generate_export(
         since=since_dt,
         providers=provider_list,
+        include_priced=include_priced,
     )
 
     return data
@@ -75,6 +81,7 @@ async def export_library(
 async def export_library_stream(
     since: Optional[str] = Query(None, description="ISO 8601 timestamp for incremental updates"),
     providers: Optional[str] = Query(None, description="Comma-separated list of providers"),
+    include_priced: bool = Query(False, description="Include priced (rent/buy/subscription) content; default only free/unknown-priced content"),
     export_generator: ExportGenerator = Depends(get_export_generator),
 ):
     """
@@ -100,6 +107,7 @@ async def export_library_stream(
         yield from export_generator.generate_export_stream(
             since=since_dt,
             providers=provider_list,
+            include_priced=include_priced,
         )
 
     return StreamingResponse(
@@ -112,24 +120,38 @@ async def export_library_stream(
     )
 
 
-@router.get("/library/movies", response_model=List[MovieExport])
+@router.get("/library/movies", response_model=PaginatedMovies)
 async def get_movies(
     provider: Optional[str] = Query(None, description="Filter by provider"),
+    include_priced: bool = Query(False, description="Include priced content; default only free/unknown-priced content"),
+    limit: int = Query(100, ge=1, le=1000, description="Items per page"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
     db: DatabaseManager = Depends(get_db),
     export_generator: ExportGenerator = Depends(get_export_generator),
 ):
-    """Get all movies (legacy endpoint)"""
+    """Get movies, paginated at the SQL level."""
     with db.session() as session:
         from ..database.models import Movie
 
         query = session.query(Movie).filter(Movie.is_available == True)
         if provider:
             query = query.filter(Movie.provider == provider)
+        if not include_priced:
+            query = query.filter(
+                (Movie.pricing_access_type.is_(None)) |
+                (Movie.pricing_access_type.in_(FREE_ACCESS_TYPES))
+            )
 
-        movies = query.all()
+        total = query.count()
+        movies = query.order_by(Movie.title).limit(limit).offset(offset).all()
         provider_priority = export_generator.config.provider_priority
 
-        return [export_generator._get_movie_export(m, provider_priority) for m in movies]
+        return PaginatedMovies(
+            items=[export_generator._get_movie_export(m, provider_priority) for m in movies],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
 
 
 @router.get("/library/shows", response_model=List[ShowSummary])
@@ -152,24 +174,49 @@ async def get_shows(
     return [export_generator._get_show_summary(s) for s in shows]
 
 
-@router.get("/library/shows/{show_id}/episodes", response_model=List[EpisodeExport])
+@router.get("/library/shows/{show_id}/episodes", response_model=PaginatedEpisodes)
 async def get_show_episodes(
     show_id: str,
     provider: Optional[str] = Query(None, description="Filter by provider"),
+    include_priced: bool = Query(False, description="Include priced content; default only free/unknown-priced content"),
+    limit: int = Query(100, ge=1, le=1000, description="Items per page"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
     db: DatabaseManager = Depends(get_db),
     export_generator: ExportGenerator = Depends(get_export_generator),
 ):
-    """Get episodes for a specific show (legacy endpoint)"""
-    episodes = db.get_episodes_for_show(show_id, provider=provider)
-    provider_priority = export_generator.config.provider_priority
+    """Get episodes for a specific show, paginated at the SQL level."""
+    with db.session() as session:
+        query = session.query(TVEpisode).filter(
+            TVEpisode.show_id == show_id,
+            TVEpisode.is_available == True
+        )
+        if provider:
+            query = query.filter(TVEpisode.provider == provider)
+        if not include_priced:
+            query = query.filter(
+                (TVEpisode.pricing_access_type.is_(None)) |
+                (TVEpisode.pricing_access_type.in_(FREE_ACCESS_TYPES))
+            )
+
+        total = query.count()
+        episodes = query.order_by(
+            TVEpisode.season_number, TVEpisode.episode_number
+        ).offset(offset).limit(limit).all()
+
+        provider_priority = export_generator.config.provider_priority
 
     show = db.get_show_by_id(show_id)
-    show_title = show.title if show else "Unknown Show"
+    show_title = show["title"] if show else "Unknown Show"
 
-    return [
-        export_generator._get_episode_export(e, show_title, provider_priority)
-        for e in episodes
-    ]
+    return PaginatedEpisodes(
+        items=[
+            export_generator._get_episode_export(e, show_title, provider_priority)
+            for e in episodes
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("/sync", response_model=SyncResponse)
@@ -183,15 +230,21 @@ async def trigger_sync(
     Trigger a manual sync (crawl + library generation).
 
     Runs in the background. Check /api/status for progress.
-    Guarded against overlapping syncs -- note this guard only covers syncs
-    triggered via this endpoint; the cron-scheduled crawl in main.py does not
-    currently check or set this state (see note in scheduler wiring).
+
+    Sync state lives in the database (DatabaseManager.get_sync_state /
+    set_sync_state), not an in-memory dict -- so the overlap guard below
+    holds even if the API runs with multiple worker processes.
+
+    This guard only covers syncs triggered via this endpoint; the
+    cron-scheduled crawl in main.py does not currently check or set this
+    state (see note in scheduler wiring).
     """
-    sync_state = get_sync_state()
+    sync_state = db.get_sync_state()
     if sync_state["sync_in_progress"]:
+        current_progress = sync_state.get("sync_progress") or {}
         raise HTTPException(
             status_code=409,
-            detail=f"Sync already in progress for provider(s): {sync_state.get('sync_progress', {}).get('providers', [])}"
+            detail=f"Sync already in progress for provider(s): {current_progress.get('providers', [])}"
         )
 
     if request.provider:
@@ -201,14 +254,20 @@ async def trigger_sync(
 
     logger.info(f"Manual sync triggered for providers: {providers}")
 
-    set_sync_state(True, {"providers": providers, "current": None, "completed": []})
+    db.set_sync_state(True, {"providers": providers, "current": None, "completed": []})
+    job_id = db.create_sync_job(provider=request.provider)
 
     def run_sync_job():
+        total_added = 0
+        total_updated = 0
+        total_found = 0
         try:
+            db.update_sync_job(job_id, status="running")
+
             for idx, provider in enumerate(providers):
                 logger.info(f"Background sync: starting {provider}")
 
-                set_sync_state(True, {
+                db.set_sync_state(True, {
                     "providers": providers,
                     "current": provider,
                     "completed": providers[:idx],
@@ -221,23 +280,53 @@ async def trigger_sync(
 
                 if result.get("success"):
                     logger.info(f"Background sync: {provider} completed successfully")
+                    db_stats = result.get("db_stats", {})
+                    traversal_stats = result.get("traversal_stats", {})
+                    total_added += db_stats.get("movies_added", 0) + db_stats.get("episodes_added", 0)
+                    total_updated += db_stats.get("movies_updated", 0) + db_stats.get("episodes_updated", 0)
+                    total_found += traversal_stats.get("total_items", 0)
                 else:
                     logger.error(f"Background sync: {provider} failed: {result.get('error')}")
 
-            set_sync_state(False, {
+                # Persist incremental progress after each provider so
+                # /api/sync callers (or anyone inspecting SyncJob rows)
+                # can see live totals during a long multi-provider sync,
+                # not just the final tally once everything finishes.
+                db.update_sync_job(
+                    job_id,
+                    status="running",
+                    items_found=total_found,
+                    items_added=total_added,
+                    items_updated=total_updated,
+                    progress={
+                        "current": provider,
+                        "completed": idx + 1,
+                        "total": len(providers),
+                    },
+                )
+
+            db.set_sync_state(False, {
                 "providers": providers,
                 "completed": providers,
                 "status": "complete"
             })
+            db.update_sync_job(
+                job_id,
+                status="complete",
+                items_found=total_found,
+                items_added=total_added,
+                items_updated=total_updated,
+            )
             logger.info("Background sync completed for all providers")
 
         except Exception as e:
             logger.error(f"Background sync failed: {e}", exc_info=True)
-            set_sync_state(False, {
+            db.set_sync_state(False, {
                 "providers": providers,
                 "status": "failed",
                 "error": str(e)
             })
+            db.update_sync_job(job_id, status="failed", error=str(e))
 
     background_tasks.add_task(run_sync_job)
 
@@ -259,6 +348,7 @@ async def trigger_sync(
 async def get_changes(
     since: str = Query(..., description="ISO 8601 timestamp"),
     providers: Optional[str] = Query(None, description="Comma-separated list of providers"),
+    include_priced: bool = Query(False, description="Include priced content; default only free/unknown-priced content"),
     export_generator: ExportGenerator = Depends(get_export_generator),
 ):
     """Get changes since a given timestamp (convenience endpoint)"""
@@ -274,6 +364,7 @@ async def get_changes(
     data = export_generator.generate_export(
         since=since_dt,
         providers=provider_list,
+        include_priced=include_priced,
     )
 
     return {

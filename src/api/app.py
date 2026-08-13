@@ -3,17 +3,25 @@
 FastAPI application setup
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from .routes import router
-from .dependencies import init_dependencies
+from .dependencies import init_dependencies, get_db
 from ..config import Config
 from ..database import DatabaseManager
+from ..database.models import CrawlHistory
 from ..utils.logger import get_logger
+from ..utils.time import utcnow
 
 logger = get_logger(__name__)
+
+# A crawl older than this is considered stale for /health purposes. This is
+# deliberately generous -- the nightly/interval schedule is provider-driven
+# and can legitimately be many hours; this just catches "the scheduler died".
+_STALE_CRAWL_HOURS = 48
 
 
 def create_app(config: Config, db: DatabaseManager) -> FastAPI:
@@ -67,10 +75,47 @@ def create_app(config: Config, db: DatabaseManager) -> FastAPI:
             }
         }
 
-    # Health check
+    # Health check -- verifies DB connectivity and that a crawl has
+    # completed successfully recently, not just that the process is up.
     @app.get("/health")
-    async def health():
-        return {"status": "healthy"}
+    async def health(db: DatabaseManager = Depends(get_db)):
+        try:
+            with db.session() as session:
+                session.execute(text("SELECT 1"))
+
+                last_crawl = session.query(CrawlHistory).filter_by(
+                    status="success"
+                ).order_by(CrawlHistory.crawl_start.desc()).first()
+
+                hours_since_crawl = None
+                last_crawl_iso = None
+                if last_crawl:
+                    hours_since_crawl = (utcnow() - last_crawl.crawl_start).total_seconds() / 3600
+                    last_crawl_iso = last_crawl.crawl_start.isoformat()
+
+            if hours_since_crawl is None or hours_since_crawl > _STALE_CRAWL_HOURS:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "degraded",
+                        "database": "connected",
+                        "message": f"No successful crawl in the last {_STALE_CRAWL_HOURS} hours",
+                        "last_crawl": last_crawl_iso,
+                    }
+                )
+
+            return {
+                "status": "healthy",
+                "database": "connected",
+                "last_crawl": last_crawl_iso,
+                "hours_since_crawl": round(hours_since_crawl, 2),
+            }
+        except Exception as e:
+            logger.error(f"Health check failed: {e}", exc_info=True)
+            return JSONResponse(
+                status_code=503,
+                content={"status": "unhealthy", "error": str(e)}
+            )
 
     logger.info("FastAPI application created with shared database connection")
     return app

@@ -3,7 +3,7 @@
 Dependency injection for FastAPI
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional
 from fastapi import Depends, HTTPException, status
 
 from ..config import Config
@@ -18,9 +18,15 @@ _config: Optional[Config] = None
 _db: Optional[DatabaseManager] = None
 _export_generator: Optional[ExportGenerator] = None
 
-# Sync state
-_sync_in_progress: bool = False
-_sync_progress: Dict[str, Any] = {}
+# NOTE: Sync state is intentionally NOT tracked here. It used to live in a
+# module-level dict (_sync_in_progress / _sync_progress), which is
+# per-process state -- it silently breaks the overlap guard on
+# POST /api/sync the moment the API runs with more than one worker, since
+# two workers would each have their own copy and neither would see the
+# other's in-progress sync. Sync state now lives in the database via
+# DatabaseManager.get_sync_state() / set_sync_state() (see db_manager.py),
+# which is visible to every worker. Call those directly instead of adding
+# equivalents here.
 
 
 def init_dependencies(config: Config, db: DatabaseManager):
@@ -61,21 +67,3 @@ def get_export_generator() -> ExportGenerator:
     if _export_generator is None:
         raise RuntimeError("Export generator not initialized")
     return _export_generator
-
-
-def set_sync_state(in_progress: bool, progress: Optional[Dict[str, Any]] = None):
-    """Update sync state"""
-    global _sync_in_progress, _sync_progress
-    _sync_in_progress = in_progress
-    if progress is not None:
-        _sync_progress = progress
-    elif not in_progress:
-        _sync_progress = {}
-
-
-def get_sync_state() -> Dict[str, Any]:
-    """Get current sync state"""
-    return {
-        "sync_in_progress": _sync_in_progress,
-        "sync_progress": _sync_progress,
-    }

@@ -3,8 +3,8 @@
 Provider-specific crawler that connects the tree traversal to the database
 """
 
+import re
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
 
 from .base import BaseCrawler
 from .tree_traverser import TreeTraverser
@@ -12,6 +12,7 @@ from .content_classifier import ContentClassifier, ContentType, ClassificationRe
 from ..database import DatabaseManager
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.slugify import slugify
 
 logger = get_logger(__name__)
 
@@ -78,7 +79,15 @@ class ProviderCrawler:
         # Start crawl history
         history_id = self.db.start_crawl(provider)
 
-        # Clear existing data for this provider
+        # Clear existing data for this provider. This marks every
+        # currently-available movie/episode/show mapping for this provider
+        # as is_available=False *before* traversal starts. Anything the
+        # traversal below encounters gets flipped back to True via the
+        # upsert helpers; anything it doesn't encounter (i.e. no longer on
+        # the provider) simply stays False. This "clear-then-repopulate"
+        # pattern is the mark-unavailable mechanism -- there is no need
+        # for a second pass that diffs a "seen" set against the DB at the
+        # end, since the same result already falls out of this.
         self.db.clear_provider_data(provider)
 
         # Reset stats
@@ -213,7 +222,7 @@ class ProviderCrawler:
 
         elif result.content_type == ContentType.TV_EPISODE:
             # Get or create show using the DB manager (handles session lifecycle)
-            show = self._get_or_create_show(
+            show_id = self._get_or_create_show(
                 provider=provider,
                 series_title=result.series_title or name,
                 series_id=result.series_id,
@@ -221,7 +230,7 @@ class ProviderCrawler:
                 entry=entry
             )
 
-            if show:
+            if show_id:
                 # Add to episode buffer
                 # NOTE: these keys exist in `metadata` (shared with movies)
                 # but have no corresponding column on TVEpisode -- movies
@@ -236,7 +245,7 @@ class ProviderCrawler:
                     if k not in ("original_title", "release_year", "imdb_id", "tmdb_id")
                 }
                 episode_data = {
-                    "show_id": show.id,
+                    "show_id": show_id,
                     "provider": provider,
                     "content_id": content_id,
                     "season_number": result.season_number or 0,
@@ -251,9 +260,55 @@ class ProviderCrawler:
                     self._flush_episodes()
 
     @staticmethod
-    def _extract_metadata(entry: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_pricing(entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract pricing_* columns from a raw item entry.
+
+        The backend's Content.to_dict() (see content.py) serializes the
+        Pricing dataclass under the PascalCase key "Pricing" only when
+        pricing is set; unpriced/unknown content simply omits the key.
+        Every field here defaults to None, matching Pricing's own
+        "None means unknown, not free" contract -- we must not default
+        pricing_access_type to something that reads as free.
+        """
+        pricing_fields = {
+            "pricing_access_type": None,
+            "pricing_price_points": None,
+            "pricing_required_tiers": None,
+            "pricing_required_bouquets": None,
+            "pricing_rental_duration_hours": None,
+            "pricing_catchup_duration_hours": None,
+            "pricing_replay_window_hours": None,
+            "pricing_preview_minutes": None,
+            "pricing_description": None,
+            "pricing_tax_class": None,
+        }
+
+        pricing = entry.get("pricing") or entry.get("Pricing")
+        if not pricing:
+            return pricing_fields
+
+        pricing_dict = pricing.to_dict() if hasattr(pricing, "to_dict") else pricing
+        if not isinstance(pricing_dict, dict):
+            logger.warning(f"Unexpected pricing payload type: {type(pricing_dict)!r}")
+            return pricing_fields
+
+        pricing_fields["pricing_access_type"] = pricing_dict.get("access_type")
+        pricing_fields["pricing_price_points"] = pricing_dict.get("price_points")
+        pricing_fields["pricing_required_tiers"] = pricing_dict.get("required_tiers")
+        pricing_fields["pricing_required_bouquets"] = pricing_dict.get("required_bouquets")
+        pricing_fields["pricing_rental_duration_hours"] = pricing_dict.get("rental_duration_hours")
+        pricing_fields["pricing_catchup_duration_hours"] = pricing_dict.get("catchup_duration_hours")
+        pricing_fields["pricing_replay_window_hours"] = pricing_dict.get("replay_window_hours")
+        pricing_fields["pricing_preview_minutes"] = pricing_dict.get("preview_minutes")
+        pricing_fields["pricing_description"] = pricing_dict.get("description")
+        pricing_fields["pricing_tax_class"] = pricing_dict.get("tax_class")
+        return pricing_fields
+
+    @classmethod
+    def _extract_metadata(cls, entry: Dict[str, Any]) -> Dict[str, Any]:
         """Extract metadata from VodItem for database storage"""
-        return {
+        metadata = {
             # Core metadata
             "original_title": entry.get("original_title"),
             "plot": entry.get("description") or entry.get("long_description"),
@@ -305,6 +360,9 @@ class ProviderCrawler:
             "tmdb_id": entry.get("tmdb_id"),
         }
 
+        metadata.update(cls._extract_pricing(entry))
+        return metadata
+
     def _get_or_create_show(
             self,
             provider: str,
@@ -312,9 +370,11 @@ class ProviderCrawler:
             series_id: Optional[str],
             entry: Dict[str, Any],
             parent_content_id: Optional[str] = None,
-    ) -> Optional[Any]:
+    ) -> Optional[str]:
         """
-        Get or create a TV show for an episode.
+        Get or create a TV show for an episode. Returns the show id (or
+        None if no series title is available to key off of).
+
         Delegates to DatabaseManager.get_or_create_show() which handles
         the session lifecycle correctly.
 
@@ -342,9 +402,9 @@ class ProviderCrawler:
 
         resolved_series_id = series_id or parent_content_id or ""
 
-        # Let the DB manager handle the upsert!
-        # This correctly handles both creation and updates with proper session management
-        show, created = self.db.get_or_create_show(
+        # Let the DB manager handle the upsert! This correctly handles both
+        # creation and updates with proper session management.
+        show_id, created = self.db.get_or_create_show(
             normalized_title=normalized_title,
             title=series_title,
             provider=provider,
@@ -357,13 +417,11 @@ class ProviderCrawler:
         else:
             self.stats["shows_updated"] += 1
 
-        return show
+        return show_id
 
     @staticmethod
     def _normalize_series_title(title: str) -> str:
         """Normalize series title for matching across providers"""
-        import re
-
         if not title:
             return ""
 
@@ -379,7 +437,6 @@ class ProviderCrawler:
         title = re.sub(r'\s+', ' ', title).strip()
 
         # Create slug for matching
-        from ..database.db_manager import slugify
         return slugify(title)
 
     def _flush_movies(self) -> None:
@@ -398,8 +455,11 @@ class ProviderCrawler:
             # Try one by one for recovery
             for movie in self.movie_buffer:
                 try:
-                    self.db.add_or_update_movie(**movie)
-                    self.stats["movies_added"] += 1
+                    _, created = self.db.add_or_update_movie(**movie)
+                    if created:
+                        self.stats["movies_added"] += 1
+                    else:
+                        self.stats["movies_updated"] += 1
                 except Exception as e2:
                     logger.error(f"Error adding movie {movie.get('title', 'unknown')}: {e2}")
 
@@ -421,8 +481,11 @@ class ProviderCrawler:
             # Try one by one for recovery
             for episode in self.episode_buffer:
                 try:
-                    self.db.add_or_update_episode(**episode)
-                    self.stats["episodes_added"] += 1
+                    _, created = self.db.add_or_update_episode(**episode)
+                    if created:
+                        self.stats["episodes_added"] += 1
+                    else:
+                        self.stats["episodes_updated"] += 1
                 except Exception as e2:
                     logger.error(f"Error adding episode {episode.get('title', 'unknown')}: {e2}")
 

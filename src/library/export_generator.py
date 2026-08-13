@@ -6,12 +6,13 @@ Library export generator - creates the full export response
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Tuple, Generator
+from typing import List, Dict, Any, Optional, Generator
 from urllib.parse import urlencode
 
 from sqlalchemy.orm import joinedload, selectinload
 
 from ..database import DatabaseManager
+from ..database.models import FREE_ACCESS_TYPES
 from ..config import Config
 from ..utils.logger import get_logger
 
@@ -40,7 +41,8 @@ class ExportGenerator:
         params = {"action": action, **kwargs}
         return f"plugin://{self.plugin_id}/?{urlencode(params)}"
 
-    def _get_item_hash(self, item: Dict[str, Any]) -> str:
+    @staticmethod
+    def _get_item_hash(item: Dict[str, Any]) -> str:
         """Generate a hash for change detection"""
         hashable = {
             "id": item.get("id"),
@@ -53,12 +55,15 @@ class ExportGenerator:
             "director": item.get("director"),
             "logo_url": item.get("logo_url"),
             "manifest_url": item.get("manifest_url"),
+            "pricing_access_type": item.get("pricing_access_type"),
+            "pricing_price_points": item.get("pricing_price_points"),
         }
         clean = {k: v for k, v in hashable.items() if v is not None}
-        sorted_json = json.dumps(clean, sort_keys=True)
+        sorted_json = json.dumps(clean, sort_keys=True, default=str)
         return hashlib.sha256(sorted_json.encode()).hexdigest()[:16]
 
-    def _get_show_summary(self, show) -> Dict[str, Any]:
+    @staticmethod
+    def _get_show_summary(show) -> Dict[str, Any]:
         """Convert TVShow to summary dict"""
         provider_ids = {}
         for mapping in show.provider_mappings:
@@ -110,6 +115,17 @@ class ExportGenerator:
             "is_sport": movie.is_sport,
             "hash": self._get_item_hash(movie.to_dict()),
             "last_seen": movie.last_seen,
+            # Pricing
+            "pricing_access_type": movie.pricing_access_type,
+            "pricing_price_points": movie.pricing_price_points,
+            "pricing_required_tiers": movie.pricing_required_tiers,
+            "pricing_required_bouquets": movie.pricing_required_bouquets,
+            "pricing_rental_duration_hours": movie.pricing_rental_duration_hours,
+            "pricing_catchup_duration_hours": movie.pricing_catchup_duration_hours,
+            "pricing_replay_window_hours": movie.pricing_replay_window_hours,
+            "pricing_preview_minutes": movie.pricing_preview_minutes,
+            "pricing_description": movie.pricing_description,
+            "pricing_tax_class": movie.pricing_tax_class,
         }
 
     def _get_episode_export(self, episode, show_title: str, provider_priority: List[str]) -> Dict[str, Any]:
@@ -146,12 +162,44 @@ class ExportGenerator:
             "is_highlight": episode.is_highlight,
             "hash": self._get_item_hash(episode.to_dict()),
             "last_seen": episode.last_seen,
+            # Pricing
+            "pricing_access_type": episode.pricing_access_type,
+            "pricing_price_points": episode.pricing_price_points,
+            "pricing_required_tiers": episode.pricing_required_tiers,
+            "pricing_required_bouquets": episode.pricing_required_bouquets,
+            "pricing_rental_duration_hours": episode.pricing_rental_duration_hours,
+            "pricing_catchup_duration_hours": episode.pricing_catchup_duration_hours,
+            "pricing_replay_window_hours": episode.pricing_replay_window_hours,
+            "pricing_preview_minutes": episode.pricing_preview_minutes,
+            "pricing_description": episode.pricing_description,
+            "pricing_tax_class": episode.pricing_tax_class,
         }
+
+    @staticmethod
+    def _apply_pricing_filter(query, model, include_priced: bool):
+        """
+        Restrict a query to free-at-point-of-use content unless the caller
+        opted in to priced content.
+
+        pricing_access_type is None for content whose pricing was never
+        determined (unknown, NOT free -- see pricing.py) as well as for
+        content that genuinely is free/AVOD, so unknown-pricing items are
+        included by default alongside the known-free ones. If that turns
+        out to be too permissive for a given deployment, tighten this to
+        `.in_(FREE_ACCESS_TYPES)` without the `is_(None)` branch.
+        """
+        if include_priced:
+            return query
+        column = model.pricing_access_type
+        return query.filter(
+            (column.is_(None)) | (column.in_(FREE_ACCESS_TYPES))
+        )
 
     def _get_deleted_items(
         self,
         since: datetime,
-        providers: Optional[List[str]] = None
+        providers: Optional[List[str]] = None,
+        include_priced: bool = False,
     ) -> List[Dict[str, Any]]:
         """Get items deleted (is_available=False) since the given timestamp."""
         deleted = []
@@ -165,6 +213,7 @@ class ExportGenerator:
             )
             if providers:
                 movie_query = movie_query.filter(Movie.provider.in_(providers))
+            movie_query = self._apply_pricing_filter(movie_query, Movie, include_priced)
 
             for movie in movie_query.all():
                 deleted.append({
@@ -180,6 +229,7 @@ class ExportGenerator:
             )
             if providers:
                 ep_query = ep_query.filter(TVEpisode.provider.in_(providers))
+            ep_query = self._apply_pricing_filter(ep_query, TVEpisode, include_priced)
 
             for ep in ep_query.all():
                 deleted.append({
@@ -195,10 +245,14 @@ class ExportGenerator:
     def generate_export(
         self,
         since: Optional[datetime] = None,
-        providers: Optional[List[str]] = None
+        providers: Optional[List[str]] = None,
+        include_priced: bool = False,
     ) -> Dict[str, Any]:
         """Generate a full library export (builds the whole response in memory)."""
-        logger.info(f"Generating export (since={since}, providers={providers})")
+        logger.info(
+            f"Generating export (since={since}, providers={providers}, "
+            f"include_priced={include_priced})"
+        )
 
         provider_priority = self.config.provider_priority
 
@@ -225,6 +279,9 @@ class ExportGenerator:
                 movie_query = movie_query.filter(Movie.last_seen >= since)
                 episode_query = episode_query.filter(TVEpisode.last_seen >= since)
 
+            movie_query = self._apply_pricing_filter(movie_query, Movie, include_priced)
+            episode_query = self._apply_pricing_filter(episode_query, TVEpisode, include_priced)
+
             shows = show_query.all()
             movies = movie_query.all()
             episodes = episode_query.all()
@@ -242,6 +299,7 @@ class ExportGenerator:
                     "total_movies": len(movies),
                     "total_episodes": len(episodes),
                     "providers": providers or self.db.get_providers(),
+                    "include_priced": include_priced,
                 }
             }
 
@@ -262,7 +320,7 @@ class ExportGenerator:
                 )
 
             if since:
-                deleted = self._get_deleted_items(since, providers)
+                deleted = self._get_deleted_items(since, providers, include_priced)
                 response["deleted"] = deleted
                 response["stats"]["deleted"] = len(deleted)
 
@@ -277,7 +335,8 @@ class ExportGenerator:
     def generate_export_stream(
         self,
         since: Optional[datetime] = None,
-        providers: Optional[List[str]] = None
+        providers: Optional[List[str]] = None,
+        include_priced: bool = False,
     ) -> Generator[str, None, None]:
         """
         Generate a library export as a streaming generator to reduce memory usage.
@@ -294,7 +353,10 @@ class ExportGenerator:
           yield_per() on a one-to-many relationship -- a show's mappings can
           be split across batch boundaries and silently truncated.
         """
-        logger.info(f"Generating streaming export (since={since}, providers={providers})")
+        logger.info(
+            f"Generating streaming export (since={since}, providers={providers}, "
+            f"include_priced={include_priced})"
+        )
 
         provider_priority = self.config.provider_priority
 
@@ -321,13 +383,16 @@ class ExportGenerator:
                 movie_query = movie_query.filter(Movie.last_seen >= since)
                 episode_query = episode_query.filter(TVEpisode.last_seen >= since)
 
+            movie_query = self._apply_pricing_filter(movie_query, Movie, include_priced)
+            episode_query = self._apply_pricing_filter(episode_query, TVEpisode, include_priced)
+
             total_shows = show_query.count()
             total_movies = movie_query.count()
             total_episodes = episode_query.count()
 
             # Compute deleted items up front so they can be folded into the
             # single stats object below -- avoids emitting a second "stats" key.
-            deleted = self._get_deleted_items(since, providers) if since else []
+            deleted = self._get_deleted_items(since, providers, include_priced) if since else []
 
             yield '{"version":"1.0",'
             yield f'"timestamp":"{datetime.now(timezone.utc).isoformat()}",'
@@ -338,7 +403,8 @@ class ExportGenerator:
                 f'"total_movies":{total_movies},'
                 f'"total_episodes":{total_episodes},'
                 f'"providers":{json.dumps(providers or self.db.get_providers())},'
-                f'"deleted":{len(deleted)}'
+                f'"deleted":{len(deleted)},'
+                f'"include_priced":{json.dumps(include_priced)}'
                 f'}},'
             )
 

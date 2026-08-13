@@ -4,7 +4,6 @@ SQLAlchemy models for VOD crawler database - Aligned with Backend VodItem/Conten
 """
 
 import uuid
-from datetime import datetime, timezone
 from typing import Dict, Any
 
 from sqlalchemy import (
@@ -13,7 +12,32 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship
 
+from ..utils.time import utcnow
+
 Base = declarative_base()
+
+
+# Pricing columns shared by TVEpisode and Movie. Kept as a single list so
+# the two tables can't silently drift apart, and so db_manager.py's
+# whitelist arrays can import the same names instead of hand-copying them.
+PRICING_FIELDS = [
+    "pricing_access_type",
+    "pricing_price_points",
+    "pricing_required_tiers",
+    "pricing_required_bouquets",
+    "pricing_rental_duration_hours",
+    "pricing_catchup_duration_hours",
+    "pricing_replay_window_hours",
+    "pricing_preview_minutes",
+    "pricing_description",
+    "pricing_tax_class",
+]
+
+# Access types that are free at point of use (backend AccessType.FREE /
+# AccessType.AVOD). Pricing.to_dict() serializes the enum via `.value`,
+# which is lowercase ("free", "avod") -- filters against these columns
+# must match that casing exactly or they silently match nothing.
+FREE_ACCESS_TYPES = ("free", "avod")
 
 
 class ShowProvider(Base):
@@ -24,9 +48,8 @@ class ShowProvider(Base):
     provider = Column(String(100), primary_key=True)
     provider_id = Column(String(255), nullable=False)
 
-    first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
-                       onupdate=lambda: datetime.now(timezone.utc))
+    first_seen = Column(DateTime, default=utcnow)
+    last_seen = Column(DateTime, default=utcnow, onupdate=utcnow)
     is_available = Column(Boolean, default=True)
 
     show = relationship("TVShow", back_populates="provider_mappings")
@@ -59,9 +82,8 @@ class TVShow(Base):
     tmdb_id = Column(String(50), nullable=True)
     tvdb_id = Column(String(50), nullable=True)
 
-    first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
-                       onupdate=lambda: datetime.now(timezone.utc))
+    first_seen = Column(DateTime, default=utcnow)
+    last_seen = Column(DateTime, default=utcnow, onupdate=utcnow)
     is_available = Column(Boolean, default=True)
 
     episodes = relationship("TVEpisode", back_populates="show", cascade="all, delete-orphan")
@@ -151,10 +173,22 @@ class TVEpisode(Base):
     trailer_url = Column(String(1000), nullable=True)
     is_highlight = Column(Boolean, default=False)
 
+    # Pricing (mirrors backend Pricing.to_dict(); None everywhere means
+    # "unknown", not "free" -- see pricing.py's docstring on that model)
+    pricing_access_type = Column(String(50), nullable=True)
+    pricing_price_points = Column(JSON, nullable=True)
+    pricing_required_tiers = Column(JSON, nullable=True)
+    pricing_required_bouquets = Column(JSON, nullable=True)
+    pricing_rental_duration_hours = Column(Integer, nullable=True)
+    pricing_catchup_duration_hours = Column(Integer, nullable=True)
+    pricing_replay_window_hours = Column(Integer, nullable=True)
+    pricing_preview_minutes = Column(Integer, nullable=True)
+    pricing_description = Column(String(500), nullable=True)
+    pricing_tax_class = Column(String(50), nullable=True)
+
     # Status
-    first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
-                       onupdate=lambda: datetime.now(timezone.utc))
+    first_seen = Column(DateTime, default=utcnow)
+    last_seen = Column(DateTime, default=utcnow, onupdate=utcnow)
     is_available = Column(Boolean, default=True)
 
     show = relationship("TVShow", back_populates="episodes")
@@ -166,6 +200,8 @@ class TVEpisode(Base):
         Index("idx_episodes_season_episode", "show_id", "season_number", "episode_number"),
         Index("idx_episodes_available", "is_available"),
         Index("idx_episodes_provider", "provider"),
+        Index("idx_episodes_last_seen", "last_seen"),
+        Index("idx_episodes_pricing_access_type", "pricing_access_type"),
     )
 
     def __repr__(self):
@@ -210,6 +246,16 @@ class TVEpisode(Base):
             "country": self.country,
             "trailer_url": self.trailer_url,
             "is_highlight": self.is_highlight,
+            "pricing_access_type": self.pricing_access_type,
+            "pricing_price_points": self.pricing_price_points,
+            "pricing_required_tiers": self.pricing_required_tiers,
+            "pricing_required_bouquets": self.pricing_required_bouquets,
+            "pricing_rental_duration_hours": self.pricing_rental_duration_hours,
+            "pricing_catchup_duration_hours": self.pricing_catchup_duration_hours,
+            "pricing_replay_window_hours": self.pricing_replay_window_hours,
+            "pricing_preview_minutes": self.pricing_preview_minutes,
+            "pricing_description": self.pricing_description,
+            "pricing_tax_class": self.pricing_tax_class,
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
             "is_available": self.is_available,
@@ -274,10 +320,21 @@ class Movie(Base):
     is_highlight = Column(Boolean, default=False)
     is_sport = Column(Boolean, default=False)
 
+    # Pricing (mirrors backend Pricing.to_dict())
+    pricing_access_type = Column(String(50), nullable=True)
+    pricing_price_points = Column(JSON, nullable=True)
+    pricing_required_tiers = Column(JSON, nullable=True)
+    pricing_required_bouquets = Column(JSON, nullable=True)
+    pricing_rental_duration_hours = Column(Integer, nullable=True)
+    pricing_catchup_duration_hours = Column(Integer, nullable=True)
+    pricing_replay_window_hours = Column(Integer, nullable=True)
+    pricing_preview_minutes = Column(Integer, nullable=True)
+    pricing_description = Column(String(500), nullable=True)
+    pricing_tax_class = Column(String(50), nullable=True)
+
     # Status
-    first_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc),
-                       onupdate=lambda: datetime.now(timezone.utc))
+    first_seen = Column(DateTime, default=utcnow)
+    last_seen = Column(DateTime, default=utcnow, onupdate=utcnow)
     is_available = Column(Boolean, default=True)
 
     __table_args__ = (
@@ -286,6 +343,8 @@ class Movie(Base):
         Index("idx_movies_release_year", "release_year"),
         Index("idx_movies_is_available", "is_available"),
         Index("idx_movies_is_sport", "is_sport"),
+        Index("idx_movies_last_seen", "last_seen"),
+        Index("idx_movies_pricing_access_type", "pricing_access_type"),
     )
 
     def __repr__(self):
@@ -330,6 +389,16 @@ class Movie(Base):
             "trailer_url": self.trailer_url,
             "is_highlight": self.is_highlight,
             "is_sport": self.is_sport,
+            "pricing_access_type": self.pricing_access_type,
+            "pricing_price_points": self.pricing_price_points,
+            "pricing_required_tiers": self.pricing_required_tiers,
+            "pricing_required_bouquets": self.pricing_required_bouquets,
+            "pricing_rental_duration_hours": self.pricing_rental_duration_hours,
+            "pricing_catchup_duration_hours": self.pricing_catchup_duration_hours,
+            "pricing_replay_window_hours": self.pricing_replay_window_hours,
+            "pricing_preview_minutes": self.pricing_preview_minutes,
+            "pricing_description": self.pricing_description,
+            "pricing_tax_class": self.pricing_tax_class,
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
             "is_available": self.is_available,
@@ -388,18 +457,83 @@ class VodCache(Base):
     content_type = Column(String(50), nullable=False)
 
     raw_data = Column(JSON, nullable=False)
-    hash = Column(String(64), nullable=True)
+    # NOTE: renamed from `hash` -> `content_hash`. `hash` shadows the Python
+    # builtin on the instance attribute and (more importantly) is a
+    # reserved word in some SQL dialects; content_hash is unambiguous.
+    content_hash = Column(String(64), nullable=True)
 
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
-                        onupdate=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     __table_args__ = (
         UniqueConstraint("provider", "content_id", "content_type",
                          name="uq_vod_cache_provider_content_type"),
         Index("idx_vod_cache_provider_type", "provider", "content_type"),
-        Index("idx_vod_cache_hash", "hash"),
+        Index("idx_vod_cache_hash", "content_hash"),
     )
 
     def __repr__(self):
         return f"<VodCache provider={self.provider!r} content_id={self.content_id!r} type={self.content_type!r}>"
+
+
+class SyncState(Base):
+    """
+    Singleton row holding the current sync-in-progress state.
+
+    This replaces an in-memory module-level dict for sync state: an
+    in-memory dict is per-process, so it silently stops working the moment
+    the API runs with more than one worker (uvicorn --workers > 1, or
+    behind gunicorn) -- concurrent requests could then both believe no
+    sync is running and race each other. A DB-backed singleton row is
+    visible to every worker.
+    """
+    __tablename__ = "sync_state"
+
+    id = Column(Integer, primary_key=True, default=1)  # Always 1 -- singleton
+    in_progress = Column(Boolean, default=False)
+    progress = Column(JSON, nullable=True)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+    def __repr__(self):
+        return f"<SyncState in_progress={self.in_progress}>"
+
+
+class SyncJob(Base):
+    """Historical record of individual sync runs, for auditing/debugging."""
+    __tablename__ = "sync_jobs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider = Column(String(100), nullable=True)  # None means "all providers"
+    started_at = Column(DateTime, default=utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    status = Column(String(50), default="pending")  # pending, running, complete, failed
+    error = Column(Text, nullable=True)
+    progress = Column(JSON, nullable=True)
+    items_found = Column(Integer, default=0)
+    items_added = Column(Integer, default=0)
+    items_updated = Column(Integer, default=0)
+    items_removed = Column(Integer, default=0)
+
+    __table_args__ = (
+        Index("idx_sync_jobs_status", "status"),
+        Index("idx_sync_jobs_provider", "provider"),
+        Index("idx_sync_jobs_started_at", "started_at"),
+    )
+
+    def __repr__(self):
+        return f"<SyncJob id={self.id!r} provider={self.provider!r} status={self.status!r}>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "provider": self.provider,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "status": self.status,
+            "error": self.error,
+            "progress": self.progress,
+            "items_found": self.items_found,
+            "items_added": self.items_added,
+            "items_updated": self.items_updated,
+            "items_removed": self.items_removed,
+        }

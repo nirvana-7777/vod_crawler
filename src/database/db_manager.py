@@ -6,22 +6,50 @@ Database manager for VOD crawler - Aligned with Backend VodItem/Content
 import uuid
 import hashlib
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text, distinct, exists, tuple_
+from sqlalchemy import create_engine, text, distinct, exists, tuple_, func
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import sessionmaker, Session, scoped_session, joinedload
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 
 from .models import (
-    Base, TVShow, TVEpisode, Movie,
-    CrawlHistory, VodCache, ShowProvider
+    Base, TVShow, TVEpisode, Movie, CrawlHistory, VodCache, ShowProvider,
+    SyncState, SyncJob, PRICING_FIELDS,
 )
 from ..utils.logger import get_logger
+from ..utils.time import utcnow
+from ..utils.slugify import slugify
 
 logger = get_logger(__name__)
+
+# Whitelisted mutable fields for the single-row upsert helpers. Kept as
+# module-level constants (rather than re-typed in every method) so the
+# episode/movie field lists and the pricing fields can't silently drift
+# out of sync with each other.
+_EPISODE_MUTABLE_FIELDS = [
+    'title', 'series_title', 'air_date', 'duration_seconds',
+    'plot', 'long_description', 'rating', 'genres', 'genre',
+    'cast', 'director', 'mode', 'logo_url', 'manifest_url',
+    'manifest_script', 'session_manifest', 'license_url',
+    'certificate_url', 'drm_config', 'cdm_type', 'use_cdm',
+    'cdm_mode', 'video', 'on_demand', 'speed_up',
+    'streaming_format', 'quality', 'language', 'country',
+    'trailer_url', 'is_highlight',
+] + PRICING_FIELDS
+
+_MOVIE_MUTABLE_FIELDS = [
+    'title', 'original_title', 'plot', 'long_description',
+    'release_year', 'duration_seconds', 'rating', 'genres', 'genre',
+    'cast', 'director', 'imdb_id', 'tmdb_id', 'mode', 'logo_url',
+    'manifest_url', 'manifest_script', 'session_manifest',
+    'license_url', 'certificate_url', 'drm_config', 'cdm_type',
+    'use_cdm', 'cdm_mode', 'video', 'on_demand', 'speed_up',
+    'streaming_format', 'quality', 'language', 'country',
+    'trailer_url', 'is_highlight', 'is_sport',
+] + PRICING_FIELDS
 
 
 class DatabaseManager:
@@ -39,8 +67,8 @@ class DatabaseManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.config = config
 
-        # REMOVED StaticPool - use default connection pool
-        # Each session gets its own connection, safe for multi-threaded use
+        # Each session gets its own connection from the default pool --
+        # safe for multi-threaded use (no StaticPool).
         self.engine = create_engine(
             f"sqlite:///{self.db_path}",
             echo=False,
@@ -62,6 +90,8 @@ class DatabaseManager:
             conn.execute(text("PRAGMA journal_mode=WAL"))
             conn.execute(text("PRAGMA synchronous=NORMAL"))
             conn.execute(text("PRAGMA cache_size=10000"))
+            conn.execute(text("PRAGMA mmap_size=268435456"))  # 256MB
+            conn.execute(text("PRAGMA foreign_keys=ON"))
             conn.commit()
 
     @contextmanager
@@ -91,19 +121,27 @@ class DatabaseManager:
             provider: str,
             provider_id: str,
             **kwargs
-    ) -> Tuple[TVShow, bool]:
+    ) -> Tuple[str, bool]:
+        """
+        Get or create a TV show. Returns (show_id, created) rather than the
+        ORM object -- callers (the crawler) only ever need the id to attach
+        episodes to, and returning a bare id sidesteps any risk of a
+        DetachedInstanceError if a caller touches a lazily-loaded attribute
+        after this session has closed.
+        """
         self._validate_provider(provider)
 
         with self.session() as session:
             # Look up by (provider, provider_id) FIRST. This is the
             # authoritative identity for "have we already seen this exact
-            # season/series from this provider" -- normalized_title alone
-            # is not reliable because the same show can arrive with subtly
-            # different title text across different lanes/categories (extra
-            # whitespace, promo suffixes, etc.), which would otherwise
-            # produce two different TVShow rows for what is really one show,
-            # and the second one's ShowProvider insert then collides on the
-            # (provider, provider_id) unique constraint.
+            # series from this provider" -- normalized_title alone is not
+            # reliable because the same show can arrive with subtly
+            # different title text across different lanes/categories
+            # (extra whitespace, promo suffixes, etc.), which would
+            # otherwise produce two different TVShow rows for what is
+            # really one show, and the second one's ShowProvider insert
+            # then collides on the (provider, provider_id) unique
+            # constraint.
             show = None
             if provider_id:
                 existing_mapping = session.query(ShowProvider).filter_by(
@@ -111,20 +149,16 @@ class DatabaseManager:
                     provider_id=provider_id
                 ).first()
                 if existing_mapping:
-                    show = session.query(TVShow).options(
-                        joinedload(TVShow.provider_mappings)
-                    ).filter_by(id=existing_mapping.show_id).first()
+                    show = session.query(TVShow).filter_by(id=existing_mapping.show_id).first()
 
             if show is None:
-                show = session.query(TVShow).options(
-                    joinedload(TVShow.provider_mappings)
-                ).filter_by(
+                show = session.query(TVShow).filter_by(
                     normalized_title=normalized_title
                 ).first()
 
             if show:
                 show.title = title
-                show.last_seen = datetime.now(timezone.utc)
+                show.last_seen = utcnow()
                 show.is_available = True
 
                 provider_mapping = session.query(ShowProvider).filter_by(
@@ -134,18 +168,17 @@ class DatabaseManager:
 
                 if provider_mapping:
                     provider_mapping.provider_id = provider_id
-                    provider_mapping.last_seen = datetime.now(timezone.utc)
+                    provider_mapping.last_seen = utcnow()
                     provider_mapping.is_available = True
                 else:
-                    new_mapping = ShowProvider(
+                    session.add(ShowProvider(
                         show_id=show.id,
                         provider=provider,
                         provider_id=provider_id,
-                        first_seen=datetime.now(timezone.utc),
-                        last_seen=datetime.now(timezone.utc),
+                        first_seen=utcnow(),
+                        last_seen=utcnow(),
                         is_available=True
-                    )
-                    show.provider_mappings.append(new_mapping)
+                    ))
 
                 for key in ['plot', 'poster_url', 'backdrop_url', 'genres', 'genre',
                             'release_year', 'imdb_id', 'tmdb_id', 'tvdb_id']:
@@ -168,15 +201,12 @@ class DatabaseManager:
                         provider=provider,
                         provider_id=provider_id
                     ).first()
-                    winner_show = session.query(TVShow).options(
-                        joinedload(TVShow.provider_mappings)
-                    ).filter_by(id=winner_mapping.show_id).first()
-                    return winner_show, False
+                    return winner_mapping.show_id, False
 
-                return show, False
+                return show.id, False
             else:
                 show_id = slugify(normalized_title) or str(uuid.uuid4())
-                existing = session.query(TVShow).filter_by(id=show_id).first()
+                existing = session.query(TVShow.id).filter_by(id=show_id).first()
                 if existing:
                     show_id = str(uuid.uuid4())
 
@@ -184,8 +214,8 @@ class DatabaseManager:
                     id=show_id,
                     title=title,
                     normalized_title=normalized_title,
-                    first_seen=datetime.now(timezone.utc),
-                    last_seen=datetime.now(timezone.utc),
+                    first_seen=utcnow(),
+                    last_seen=utcnow(),
                     is_available=True,
                 )
 
@@ -195,15 +225,14 @@ class DatabaseManager:
                         setattr(show, key, kwargs[key])
 
                 session.add(show)
-
-                mapping = ShowProvider(
+                session.add(ShowProvider(
+                    show_id=show_id,
                     provider=provider,
                     provider_id=provider_id,
-                    first_seen=datetime.now(timezone.utc),
-                    last_seen=datetime.now(timezone.utc),
+                    first_seen=utcnow(),
+                    last_seen=utcnow(),
                     is_available=True
-                )
-                show.provider_mappings.append(mapping)
+                ))
 
                 try:
                     session.commit()
@@ -221,18 +250,24 @@ class DatabaseManager:
                         provider=provider,
                         provider_id=provider_id
                     ).first()
-                    winner_show = session.query(TVShow).options(
-                        joinedload(TVShow.provider_mappings)
-                    ).filter_by(id=winner_mapping.show_id).first()
-                    return winner_show, False
+                    return winner_mapping.show_id, False
 
-                return show, True
+                return show_id, True
 
-    def get_show_by_id(self, show_id: str) -> Optional[TVShow]:
+    def get_show_by_id(self, show_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a show as a plain dict.
+
+        Returned as a dict (not the ORM object) because callers (the API
+        routes) only ever read plain fields from this after the session
+        that produced it has closed -- returning a dict makes that safe
+        and explicit instead of relying on expire_on_commit=False.
+        """
         with self.session() as session:
-            return session.query(TVShow).options(
+            show = session.query(TVShow).options(
                 joinedload(TVShow.provider_mappings)
             ).filter_by(id=show_id).first()
+            return show.to_dict() if show else None
 
     def get_show_by_provider_id(self, provider: str, provider_id: str) -> Optional[TVShow]:
         self._validate_provider(provider)
@@ -279,7 +314,7 @@ class DatabaseManager:
             if not show:
                 return False
             show.is_available = available
-            show.last_seen = datetime.now(timezone.utc)
+            show.last_seen = utcnow()
             session.commit()
             return True
 
@@ -310,43 +345,28 @@ class DatabaseManager:
                 episode.show_id = show_id
                 episode.season_number = season_number
                 episode.episode_number = episode_number
-                episode.last_seen = datetime.now(timezone.utc)
+                episode.last_seen = utcnow()
                 episode.is_available = True
 
-                for key in ['title', 'series_title', 'air_date', 'duration_seconds',
-                            'plot', 'long_description', 'rating', 'genres', 'genre',
-                            'cast', 'director', 'mode', 'logo_url', 'manifest_url',
-                            'manifest_script', 'session_manifest', 'license_url',
-                            'certificate_url', 'drm_config', 'cdm_type', 'use_cdm',
-                            'cdm_mode', 'video', 'on_demand', 'speed_up',
-                            'streaming_format', 'quality', 'language', 'country',
-                            'trailer_url', 'is_highlight']:
+                for key in _EPISODE_MUTABLE_FIELDS:
                     if key in kwargs and kwargs[key] is not None:
                         setattr(episode, key, kwargs[key])
                 session.commit()
                 return episode, False
             else:
-                episode_id = str(uuid.uuid4())
                 episode = TVEpisode(
-                    id=episode_id,
+                    id=str(uuid.uuid4()),
                     show_id=show_id,
                     provider=provider,
                     content_id=content_id,
                     season_number=season_number,
                     episode_number=episode_number,
-                    first_seen=datetime.now(timezone.utc),
-                    last_seen=datetime.now(timezone.utc),
+                    first_seen=utcnow(),
+                    last_seen=utcnow(),
                     is_available=True,
                 )
 
-                for key in ['title', 'series_title', 'air_date', 'duration_seconds',
-                            'plot', 'long_description', 'rating', 'genres', 'genre',
-                            'cast', 'director', 'mode', 'logo_url', 'manifest_url',
-                            'manifest_script', 'session_manifest', 'license_url',
-                            'certificate_url', 'drm_config', 'cdm_type', 'use_cdm',
-                            'cdm_mode', 'video', 'on_demand', 'speed_up',
-                            'streaming_format', 'quality', 'language', 'country',
-                            'trailer_url', 'is_highlight']:
+                for key in _EPISODE_MUTABLE_FIELDS:
                     if key in kwargs and kwargs[key] is not None:
                         setattr(episode, key, kwargs[key])
                 session.add(episode)
@@ -355,45 +375,39 @@ class DatabaseManager:
 
     def bulk_upsert_episodes(self, episodes: List[Dict[str, Any]]) -> Dict[str, int]:
         """Bulk upsert episodes with accurate added/updated stats"""
-        from sqlalchemy.dialects.sqlite import insert
         stats = {"added": 0, "updated": 0}
 
         if not episodes:
             return stats
 
-        # Identity is (provider, content_id) -- matches the uq_episode_provider_content
-        # constraint. season_number/episode_number are data, not identity:
-        # distinct episodes can legitimately share (0, 0) when a provider
-        # doesn't supply real values, and content_id is what actually
-        # disambiguates them.
+        # Identity is (provider, content_id) -- matches the
+        # uq_episode_provider_content constraint. season_number/
+        # episode_number are data, not identity: distinct episodes can
+        # legitimately share (0, 0) when a provider doesn't supply real
+        # values, and content_id is what actually disambiguates them.
         immutable_fields = {'provider', 'content_id', 'id', 'first_seen'}
 
         with self.session() as session:
-            # Determine which rows already exist for accurate stats
+            # Single batched existence check instead of one query per row.
             keys = [(e['provider'], e['content_id']) for e in episodes]
             existing = set()
             if keys:
-                for provider, content_id in keys:
-                    exists_query = session.query(TVEpisode.id).filter(
-                        TVEpisode.provider == provider,
-                        TVEpisode.content_id == content_id
-                    ).first()
-                    if exists_query:
-                        existing.add((provider, content_id))
+                rows = session.query(TVEpisode.provider, TVEpisode.content_id).filter(
+                    tuple_(TVEpisode.provider, TVEpisode.content_id).in_(keys)
+                ).all()
+                existing = {(p, c) for p, c in rows}
 
             for ep_data in episodes:
                 self._validate_provider(ep_data['provider'])
 
-                # Ensure ID is set (generate if not present)
-                if 'id' not in ep_data or not ep_data['id']:
+                if not ep_data.get('id'):
                     ep_data['id'] = str(uuid.uuid4())
 
-                # Dynamically build the update set
                 update_set = {
                     k: v for k, v in ep_data.items()
                     if k not in immutable_fields
                 }
-                update_set['last_seen'] = datetime.now(timezone.utc)
+                update_set['last_seen'] = utcnow()
                 update_set['is_available'] = True
 
                 stmt = insert(TVEpisode).values(**ep_data)
@@ -403,13 +417,12 @@ class DatabaseManager:
                 )
                 session.execute(stmt)
 
-                # Accurate stats using pre-checked existing rows
                 key = (ep_data['provider'], ep_data['content_id'])
                 if key in existing:
                     stats["updated"] += 1
                 else:
                     stats["added"] += 1
-                    existing.add(key)  # Add to set so subsequent duplicates count as updates
+                    existing.add(key)  # subsequent duplicates in this batch count as updates
 
             session.commit()
             return stats
@@ -455,7 +468,7 @@ class DatabaseManager:
                 provider=provider
             ).update({
                 "is_available": False,
-                "last_seen": datetime.now(timezone.utc)
+                "last_seen": utcnow()
             }, synchronize_session=False)
             session.commit()
             return count
@@ -467,7 +480,7 @@ class DatabaseManager:
                 provider=provider
             ).update({
                 "is_available": False,
-                "last_seen": datetime.now(timezone.utc)
+                "last_seen": utcnow()
             }, synchronize_session=False)
             session.commit()
             return count
@@ -491,17 +504,10 @@ class DatabaseManager:
 
             if movie:
                 movie.title = title
-                movie.last_seen = datetime.now(timezone.utc)
+                movie.last_seen = utcnow()
                 movie.is_available = True
 
-                for key in ['title', 'original_title', 'plot', 'long_description',
-                            'release_year', 'duration_seconds', 'rating', 'genres', 'genre',
-                            'cast', 'director', 'imdb_id', 'tmdb_id', 'mode', 'logo_url',
-                            'manifest_url', 'manifest_script', 'session_manifest',
-                            'license_url', 'certificate_url', 'drm_config', 'cdm_type',
-                            'use_cdm', 'cdm_mode', 'video', 'on_demand', 'speed_up',
-                            'streaming_format', 'quality', 'language', 'country',
-                            'trailer_url', 'is_highlight', 'is_sport']:
+                for key in _MOVIE_MUTABLE_FIELDS:
                     if key in kwargs and kwargs[key] is not None:
                         setattr(movie, key, kwargs[key])
                 session.commit()
@@ -512,19 +518,12 @@ class DatabaseManager:
                     provider=provider,
                     content_id=content_id,
                     title=title,
-                    first_seen=datetime.now(timezone.utc),
-                    last_seen=datetime.now(timezone.utc),
+                    first_seen=utcnow(),
+                    last_seen=utcnow(),
                     is_available=True,
                 )
 
-                for key in ['title', 'original_title', 'plot', 'long_description',
-                            'release_year', 'duration_seconds', 'rating', 'genres', 'genre',
-                            'cast', 'director', 'imdb_id', 'tmdb_id', 'mode', 'logo_url',
-                            'manifest_url', 'manifest_script', 'session_manifest',
-                            'license_url', 'certificate_url', 'drm_config', 'cdm_type',
-                            'use_cdm', 'cdm_mode', 'video', 'on_demand', 'speed_up',
-                            'streaming_format', 'quality', 'language', 'country',
-                            'trailer_url', 'is_highlight', 'is_sport']:
+                for key in _MOVIE_MUTABLE_FIELDS:
                     if key in kwargs and kwargs[key] is not None:
                         setattr(movie, key, kwargs[key])
                 session.add(movie)
@@ -533,7 +532,6 @@ class DatabaseManager:
 
     def bulk_upsert_movies(self, movies: List[Dict[str, Any]]) -> Dict[str, int]:
         """Bulk upsert movies with accurate added/updated stats"""
-        from sqlalchemy.dialects.sqlite import insert
         stats = {"added": 0, "updated": 0}
 
         if not movies:
@@ -542,29 +540,26 @@ class DatabaseManager:
         immutable_fields = {'provider', 'content_id', 'id', 'first_seen'}
 
         with self.session() as session:
-            # Determine which rows already exist for accurate stats
+            # Single batched existence check instead of one query per row.
             keys = [(m['provider'], m['content_id']) for m in movies]
             existing = set()
             if keys:
-                for provider, content_id in keys:
-                    exists_query = session.query(Movie.id).filter(
-                        Movie.provider == provider,
-                        Movie.content_id == content_id
-                    ).first()
-                    if exists_query:
-                        existing.add((provider, content_id))
+                rows = session.query(Movie.provider, Movie.content_id).filter(
+                    tuple_(Movie.provider, Movie.content_id).in_(keys)
+                ).all()
+                existing = {(p, c) for p, c in rows}
 
             for movie_data in movies:
                 self._validate_provider(movie_data['provider'])
 
-                # Ensure ID is set (derived from provider:content_id)
+                # Id is derived from provider:content_id, not client-supplied.
                 movie_data['id'] = f"{movie_data['provider']}:{movie_data['content_id']}"
 
                 update_set = {
                     k: v for k, v in movie_data.items()
                     if k not in immutable_fields
                 }
-                update_set['last_seen'] = datetime.now(timezone.utc)
+                update_set['last_seen'] = utcnow()
                 update_set['is_available'] = True
 
                 stmt = insert(Movie).values(**movie_data)
@@ -574,13 +569,12 @@ class DatabaseManager:
                 )
                 session.execute(stmt)
 
-                # Accurate stats using pre-checked existing rows
                 key = (movie_data['provider'], movie_data['content_id'])
                 if key in existing:
                     stats["updated"] += 1
                 else:
                     stats["added"] += 1
-                    existing.add(key)  # Add to set so subsequent duplicates count as updates
+                    existing.add(key)
 
             session.commit()
             return stats
@@ -608,7 +602,7 @@ class DatabaseManager:
                 provider=provider
             ).update({
                 "is_available": False,
-                "last_seen": datetime.now(timezone.utc)
+                "last_seen": utcnow()
             }, synchronize_session=False)
             session.commit()
             return count
@@ -620,7 +614,7 @@ class DatabaseManager:
         with self.session() as session:
             history = CrawlHistory(
                 provider=provider,
-                crawl_start=datetime.now(timezone.utc),
+                crawl_start=utcnow(),
                 status="running"
             )
             session.add(history)
@@ -642,7 +636,7 @@ class DatabaseManager:
         with self.session() as session:
             history = session.query(CrawlHistory).filter_by(id=history_id).first()
             if history:
-                history.crawl_end = datetime.now(timezone.utc)
+                history.crawl_end = utcnow()
                 history.status = status
                 history.items_found = items_found
                 history.items_added = items_added
@@ -668,6 +662,76 @@ class DatabaseManager:
                 provider=provider
             ).order_by(CrawlHistory.crawl_start.desc()).limit(limit).all()
 
+    # ========== Sync State Operations (multi-worker safe) ==========
+
+    def get_sync_state(self) -> Dict[str, Any]:
+        """Get current sync state. Safe to call from any worker process."""
+        with self.session() as session:
+            state = session.query(SyncState).filter_by(id=1).first()
+            if not state:
+                return {"sync_in_progress": False, "sync_progress": None}
+            return {
+                "sync_in_progress": state.in_progress,
+                "sync_progress": state.progress,
+            }
+
+    def set_sync_state(self, in_progress: bool, progress: Optional[Dict[str, Any]] = None) -> None:
+        """Set sync state. Safe to call from any worker process."""
+        with self.session() as session:
+            state = session.query(SyncState).filter_by(id=1).first()
+            if not state:
+                state = SyncState(id=1)
+                session.add(state)
+            state.in_progress = in_progress
+            state.progress = progress
+            state.updated_at = utcnow()
+            session.commit()
+
+    # ========== Sync Job Operations (history/auditing) ==========
+
+    def create_sync_job(self, provider: Optional[str] = None) -> str:
+        """Create a new sync job record and return its id."""
+        with self.session() as session:
+            job = SyncJob(provider=provider, status="pending", started_at=utcnow())
+            session.add(job)
+            session.commit()
+            return job.id
+
+    def update_sync_job(
+            self,
+            job_id: str,
+            status: str,
+            error: Optional[str] = None,
+            progress: Optional[Dict[str, Any]] = None,
+            items_found: Optional[int] = None,
+            items_added: Optional[int] = None,
+            items_updated: Optional[int] = None,
+            items_removed: Optional[int] = None,
+    ) -> None:
+        with self.session() as session:
+            job = session.query(SyncJob).filter_by(id=job_id).first()
+            if not job:
+                logger.warning(f"update_sync_job: job {job_id} not found")
+                return
+
+            job.status = status
+            if error is not None:
+                job.error = error
+            if progress is not None:
+                job.progress = progress
+            if items_found is not None:
+                job.items_found = items_found
+            if items_added is not None:
+                job.items_added = items_added
+            if items_updated is not None:
+                job.items_updated = items_updated
+            if items_removed is not None:
+                job.items_removed = items_removed
+            if status in ("complete", "failed"):
+                job.completed_at = utcnow()
+
+            session.commit()
+
     # ========== VOD Cache Operations ==========
 
     def cache_vod_data(
@@ -680,7 +744,7 @@ class DatabaseManager:
         self._validate_provider(provider)
         with self.session() as session:
             hash_value = hashlib.sha256(
-                json.dumps(data, sort_keys=True).encode()
+                json.dumps(data, sort_keys=True, default=str).encode()
             ).hexdigest()
             cache = session.query(VodCache).filter_by(
                 provider=provider,
@@ -689,17 +753,17 @@ class DatabaseManager:
             ).first()
             if cache:
                 cache.raw_data = data
-                cache.hash = hash_value
-                cache.updated_at = datetime.now(timezone.utc)
+                cache.content_hash = hash_value
+                cache.updated_at = utcnow()
             else:
                 cache = VodCache(
                     provider=provider,
                     content_id=content_id,
                     content_type=content_type,
                     raw_data=data,
-                    hash=hash_value,
-                    created_at=datetime.now(timezone.utc),
-                    updated_at=datetime.now(timezone.utc)
+                    content_hash=hash_value,
+                    created_at=utcnow(),
+                    updated_at=utcnow()
                 )
                 session.add(cache)
             session.commit()
@@ -732,7 +796,7 @@ class DatabaseManager:
                 content_id=content_id,
                 content_type=content_type
             ).first()
-            return cache.hash if cache else None
+            return cache.content_hash if cache else None
 
     # ========== Provider Operations ==========
 
@@ -755,7 +819,7 @@ class DatabaseManager:
                 providers.add(p[0])
             for p in mapping_providers:
                 providers.add(p[0])
-            return sorted(list(providers))
+            return sorted(providers)
 
     def clear_provider_data(self, provider: str) -> Dict[str, int]:
         self._validate_provider(provider)
@@ -766,7 +830,7 @@ class DatabaseManager:
                 is_available=True
             ).update({
                 "is_available": False,
-                "last_seen": datetime.now(timezone.utc)
+                "last_seen": utcnow()
             }, synchronize_session=False)
             results["show_mappings"] = mapping_count
 
@@ -775,6 +839,7 @@ class DatabaseManager:
             ).all()
             show_ids = [s[0] for s in show_ids]
 
+            shows_to_update = []
             if show_ids:
                 shows_to_update = session.query(TVShow.id).filter(
                     TVShow.id.in_(show_ids),
@@ -791,17 +856,17 @@ class DatabaseManager:
                         TVShow.id.in_(shows_to_update)
                     ).update({
                         "is_available": False,
-                        "last_seen": datetime.now(timezone.utc)
+                        "last_seen": utcnow()
                     }, synchronize_session=False)
 
-            results["shows_removed"] = len(shows_to_update) if show_ids else 0
+            results["shows_removed"] = len(shows_to_update)
 
             episode_count = session.query(TVEpisode).filter_by(
                 provider=provider,
                 is_available=True
             ).update({
                 "is_available": False,
-                "last_seen": datetime.now(timezone.utc)
+                "last_seen": utcnow()
             }, synchronize_session=False)
             results["episodes"] = episode_count
 
@@ -810,7 +875,7 @@ class DatabaseManager:
                 is_available=True
             ).update({
                 "is_available": False,
-                "last_seen": datetime.now(timezone.utc)
+                "last_seen": utcnow()
             }, synchronize_session=False)
             results["movies"] = movie_count
 
@@ -818,49 +883,47 @@ class DatabaseManager:
             return results
 
     def get_stats(self) -> Dict[str, Any]:
-        with self.session() as session:
-            tv_shows = session.query(TVShow).filter_by(is_available=True).count()
-            tv_episodes = session.query(TVEpisode).filter_by(is_available=True).count()
-            movies = session.query(Movie).filter_by(is_available=True).count()
+        """
+        Aggregate library stats.
 
-            providers = self.get_providers()
-            provider_stats = {}
-            for provider in providers:
-                episodes = session.query(TVEpisode).filter_by(
-                    provider=provider,
-                    is_available=True
-                ).count()
-                movies_count = session.query(Movie).filter_by(
-                    provider=provider,
-                    is_available=True
-                ).count()
-                show_mappings = session.query(ShowProvider).filter_by(
-                    provider=provider,
-                    is_available=True
-                ).count()
-                provider_stats[provider] = {
-                    "episodes": episodes,
-                    "movies": movies_count,
-                    "shows": show_mappings
+        Uses GROUP BY per table instead of one COUNT() query per
+        (provider, table) pair -- with N providers this was previously
+        1 + 3N queries; now it's a fixed 6.
+        """
+        with self.session() as session:
+            episode_counts = dict(
+                session.query(TVEpisode.provider, func.count(TVEpisode.id))
+                .filter(TVEpisode.is_available == True)
+                .group_by(TVEpisode.provider)
+                .all()
+            )
+            movie_counts = dict(
+                session.query(Movie.provider, func.count(Movie.id))
+                .filter(Movie.is_available == True)
+                .group_by(Movie.provider)
+                .all()
+            )
+            show_counts = dict(
+                session.query(ShowProvider.provider, func.count(ShowProvider.show_id))
+                .filter(ShowProvider.is_available == True)
+                .group_by(ShowProvider.provider)
+                .all()
+            )
+
+            all_providers = set(episode_counts) | set(movie_counts) | set(show_counts)
+            provider_stats = {
+                provider: {
+                    "episodes": episode_counts.get(provider, 0),
+                    "movies": movie_counts.get(provider, 0),
+                    "shows": show_counts.get(provider, 0),
                 }
-            return {
-                "total_tv_shows": tv_shows,
-                "total_tv_episodes": tv_episodes,
-                "total_movies": movies,
-                "provider_stats": provider_stats,
-                "last_updated": datetime.now(timezone.utc).isoformat()
+                for provider in all_providers
             }
 
-
-def slugify(text: str) -> str:
-    import re
-    import unicodedata
-    if not text:
-        return ""
-    text = unicodedata.normalize('NFKD', text)
-    text = ''.join(c for c in text if not unicodedata.combining(c))
-    text = text.lower()
-    text = re.sub(r'[\s\-–—/\\|]+', '_', text)
-    text = re.sub(r'[^\w\-_]', '', text)
-    text = re.sub(r'_+', '_', text)
-    return text.strip('_-')
+            return {
+                "total_tv_shows": session.query(TVShow).filter_by(is_available=True).count(),
+                "total_tv_episodes": session.query(TVEpisode).filter_by(is_available=True).count(),
+                "total_movies": session.query(Movie).filter_by(is_available=True).count(),
+                "provider_stats": provider_stats,
+                "last_updated": utcnow().isoformat(),
+            }
