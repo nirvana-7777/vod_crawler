@@ -64,6 +64,16 @@ class ShowProvider(Base):
     def __repr__(self):
         return f"<ShowProvider show_id={self.show_id!r} provider={self.provider!r} provider_id={self.provider_id!r}>"
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "show_id": self.show_id,
+            "provider": self.provider,
+            "provider_id": self.provider_id,
+            "is_available": self.is_available,
+            "first_seen": self.first_seen.isoformat() if self.first_seen else None,
+            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+        }
+
 
 class TVShow(Base):
     """Normalized TV show (merged across providers)"""

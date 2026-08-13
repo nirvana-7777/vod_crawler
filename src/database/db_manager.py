@@ -99,9 +99,9 @@ class DatabaseManager:
         session = self.SessionFactory()
         try:
             yield session
-        except Exception as e:
+        except Exception:
             session.rollback()
-            logger.error(f"Database error: {e}")
+            logger.exception("Database error")
             raise
         finally:
             session.close()
@@ -269,7 +269,8 @@ class DatabaseManager:
             ).filter_by(id=show_id).first()
             return show.to_dict() if show else None
 
-    def get_show_by_provider_id(self, provider: str, provider_id: str) -> Optional[TVShow]:
+    def get_show_by_provider_id(self, provider: str, provider_id: str) -> Optional[Dict[str, Any]]:
+        """Get a show by (provider, provider_id) as a dict."""
         self._validate_provider(provider)
         with self.session() as session:
             mapping = session.query(ShowProvider).filter_by(
@@ -277,21 +278,25 @@ class DatabaseManager:
                 provider_id=provider_id,
                 is_available=True
             ).first()
-            if mapping:
-                return session.query(TVShow).options(
-                    joinedload(TVShow.provider_mappings)
-                ).filter_by(id=mapping.show_id).first()
-            return None
+            if not mapping:
+                return None
+            show = session.query(TVShow).options(
+                joinedload(TVShow.provider_mappings)
+            ).filter_by(id=mapping.show_id).first()
+            return show.to_dict() if show else None
 
-    def get_show_provider_mapping(self, show_id: str, provider: str) -> Optional[ShowProvider]:
+    def get_show_provider_mapping(self, show_id: str, provider: str) -> Optional[Dict[str, Any]]:
+        """Get a show/provider mapping as a dict."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(ShowProvider).filter_by(
+            mapping = session.query(ShowProvider).filter_by(
                 show_id=show_id,
                 provider=provider
             ).first()
+            return mapping.to_dict() if mapping else None
 
-    def get_shows_for_provider(self, provider: str) -> List[TVShow]:
+    def get_shows_for_provider(self, provider: str) -> List[Dict[str, Any]]:
+        """Get all shows available on a provider, as a list of dicts."""
         self._validate_provider(provider)
         with self.session() as session:
             mappings = session.query(ShowProvider).filter_by(
@@ -301,12 +306,13 @@ class DatabaseManager:
             show_ids = [m.show_id for m in mappings]
             if not show_ids:
                 return []
-            return session.query(TVShow).options(
+            shows = session.query(TVShow).options(
                 joinedload(TVShow.provider_mappings)
             ).filter(
                 TVShow.id.in_(show_ids),
                 TVShow.is_available == True
             ).all()
+            return [s.to_dict() for s in shows]
 
     def update_show_availability(self, show_id: str, available: bool) -> bool:
         with self.session() as session:
@@ -427,15 +433,18 @@ class DatabaseManager:
             session.commit()
             return stats
 
-    def get_episode_by_provider(self, provider: str, content_id: str) -> Optional[TVEpisode]:
+    def get_episode_by_provider(self, provider: str, content_id: str) -> Optional[Dict[str, Any]]:
+        """Get an episode by (provider, content_id) as a dict."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(TVEpisode).filter_by(
+            episode = session.query(TVEpisode).filter_by(
                 provider=provider,
                 content_id=content_id
             ).first()
+            return episode.to_dict() if episode else None
 
-    def get_episodes_for_show(self, show_id: str, provider: Optional[str] = None) -> List[TVEpisode]:
+    def get_episodes_for_show(self, show_id: str, provider: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get episodes for a show, as a list of dicts."""
         with self.session() as session:
             query = session.query(TVEpisode).filter_by(
                 show_id=show_id,
@@ -444,21 +453,24 @@ class DatabaseManager:
             if provider:
                 self._validate_provider(provider)
                 query = query.filter_by(provider=provider)
-            return query.order_by(
+            episodes = query.order_by(
                 TVEpisode.season_number,
                 TVEpisode.episode_number
             ).all()
+            return [e.to_dict() for e in episodes]
 
-    def get_episodes_for_provider(self, provider: str) -> List[TVEpisode]:
+    def get_episodes_for_provider(self, provider: str) -> List[Dict[str, Any]]:
+        """Get all episodes for a provider, as a list of dicts."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(TVEpisode).filter_by(
+            episodes = session.query(TVEpisode).filter_by(
                 provider=provider,
                 is_available=True
             ).order_by(
                 TVEpisode.season_number,
                 TVEpisode.episode_number
             ).all()
+            return [e.to_dict() for e in episodes]
 
     def mark_episodes_unavailable(self, show_id: str, provider: str) -> int:
         self._validate_provider(provider)
@@ -579,21 +591,25 @@ class DatabaseManager:
             session.commit()
             return stats
 
-    def get_movie_by_provider(self, provider: str, content_id: str) -> Optional[Movie]:
+    def get_movie_by_provider(self, provider: str, content_id: str) -> Optional[Dict[str, Any]]:
+        """Get a movie by (provider, content_id) as a dict."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(Movie).filter_by(
+            movie = session.query(Movie).filter_by(
                 provider=provider,
                 content_id=content_id
             ).first()
+            return movie.to_dict() if movie else None
 
-    def get_movies_by_provider(self, provider: str) -> List[Movie]:
+    def get_movies_by_provider(self, provider: str) -> List[Dict[str, Any]]:
+        """Get all movies for a provider, as a list of dicts."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(Movie).filter_by(
+            movies = session.query(Movie).filter_by(
                 provider=provider,
                 is_available=True
             ).order_by(Movie.release_year.desc()).all()
+            return [m.to_dict() for m in movies]
 
     def mark_movies_unavailable(self, provider: str) -> int:
         self._validate_provider(provider)
@@ -648,19 +664,23 @@ class DatabaseManager:
                     history.details = details
                 session.commit()
 
-    def get_last_crawl(self, provider: str) -> Optional[CrawlHistory]:
+    def get_last_crawl(self, provider: str) -> Optional[Dict[str, Any]]:
+        """Get the most recent crawl history entry for a provider, as a dict."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(CrawlHistory).filter_by(
+            history = session.query(CrawlHistory).filter_by(
                 provider=provider
             ).order_by(CrawlHistory.crawl_start.desc()).first()
+            return history.to_dict() if history else None
 
-    def get_crawl_history(self, provider: str, limit: int = 10) -> List[CrawlHistory]:
+    def get_crawl_history(self, provider: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent crawl history for a provider, as a list of dicts."""
         self._validate_provider(provider)
         with self.session() as session:
-            return session.query(CrawlHistory).filter_by(
+            histories = session.query(CrawlHistory).filter_by(
                 provider=provider
             ).order_by(CrawlHistory.crawl_start.desc()).limit(limit).all()
+            return [h.to_dict() for h in histories]
 
     # ========== Sync State Operations (multi-worker safe) ==========
 

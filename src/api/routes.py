@@ -164,14 +164,18 @@ async def get_shows(
     from ..database.models import TVShow
 
     if provider:
-        shows = db.get_shows_for_provider(provider)
-    else:
-        with db.session() as session:
-            shows = session.query(TVShow).options(
-                joinedload(TVShow.provider_mappings)
-            ).filter(TVShow.is_available == True).all()
+        # get_shows_for_provider() returns dicts shaped like TVShow.to_dict()
+        # (a superset of ShowSummary's fields -- extras like imdb_id are
+        # simply dropped by the response_model). Return them directly
+        # instead of routing through _get_show_summary(), which expects
+        # ORM attribute access and would break on a plain dict.
+        return db.get_shows_for_provider(provider)
 
-    return [export_generator._get_show_summary(s) for s in shows]
+    with db.session() as session:
+        shows = session.query(TVShow).options(
+            joinedload(TVShow.provider_mappings)
+        ).filter(TVShow.is_available == True).all()
+        return [export_generator._get_show_summary(s) for s in shows]
 
 
 @router.get("/library/shows/{show_id}/episodes", response_model=PaginatedEpisodes)
