@@ -52,6 +52,16 @@ class ProviderCrawler:
         self.episode_buffer: List[Dict[str, Any]] = []
         self.buffer_size = 100  # Flush every 100 items
 
+        # content_ids (movies + episodes) for the CURRENT provider crawl
+        # that already have a pricing detail lookup on record -- populated
+        # once at the start of crawl_provider() and consulted (not
+        # re-queried) for every item _process_item() sees. See
+        # _process_item() for why this exists: category/listing responses
+        # don't carry the full Pricing object, only a dedicated per-item
+        # detail fetch does, and we only want to pay for that fetch once
+        # per item, not once per crawl.
+        self._pricing_checked_ids: set = set()
+
     def crawl_provider(self, provider: str) -> Dict[str, Any]:
         """
         Crawl a single provider's VOD catalog
@@ -103,6 +113,14 @@ class ProviderCrawler:
         # Reset buffers
         self.movie_buffer = []
         self.episode_buffer = []
+
+        # One query for the whole crawl -- see the attribute docstring in
+        # __init__ for why this can't just be looked up per-item.
+        self._pricing_checked_ids = self.db.get_pricing_checked_ids(provider)
+        logger.debug(
+            f"{len(self._pricing_checked_ids)} items already pricing-checked "
+            f"for {provider}; new/unchecked items will get a detail fetch"
+        )
 
         try:
             # Traverse the VOD tree
@@ -206,6 +224,33 @@ class ProviderCrawler:
 
         # Build common metadata from entry
         metadata = self._extract_metadata(entry)
+
+        # Category/listing responses (what we're given here) don't carry
+        # the full Pricing object -- only a dedicated per-item detail
+        # fetch (GET /vod/{content_id}) does. Only pay for that fetch once
+        # per item, ever: if we've already checked this content_id in a
+        # previous crawl, skip it and leave pricing_* out of `metadata`
+        # entirely so the upsert doesn't touch (or clobber) the existing
+        # DB values for it. This deliberately does not pick up price
+        # CHANGES on already-checked items -- see the pricing_checked
+        # column docstring in models.py.
+        if content_id and content_id not in self._pricing_checked_ids:
+            try:
+                detail = self.crawler.get_vod_node(provider=provider, content_id=content_id)
+            except Exception as e:
+                logger.debug(f"Pricing detail fetch failed for {content_id}: {e}")
+                detail = None
+
+            if detail and detail.get("entries"):
+                pricing = self._extract_pricing(detail["entries"][0])
+                metadata.update(pricing)
+                metadata["pricing_checked"] = True
+                self._pricing_checked_ids.add(content_id)
+            else:
+                # Don't mark as checked on failure/empty response -- leave
+                # it to be retried on the next crawl rather than silently
+                # giving up on this item's pricing forever.
+                logger.debug(f"No detail entry returned for {content_id}, will retry pricing next crawl")
 
         if result.content_type == ContentType.MOVIE:
             # Add to movie buffer

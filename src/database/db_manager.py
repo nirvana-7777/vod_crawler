@@ -38,7 +38,7 @@ _EPISODE_MUTABLE_FIELDS = [
     'cdm_mode', 'video', 'on_demand', 'speed_up',
     'streaming_format', 'quality', 'language', 'country',
     'trailer_url', 'is_highlight',
-] + PRICING_FIELDS
+] + PRICING_FIELDS + ['pricing_checked']
 
 _MOVIE_MUTABLE_FIELDS = [
     'title', 'original_title', 'plot', 'long_description',
@@ -49,7 +49,7 @@ _MOVIE_MUTABLE_FIELDS = [
     'use_cdm', 'cdm_mode', 'video', 'on_demand', 'speed_up',
     'streaming_format', 'quality', 'language', 'country',
     'trailer_url', 'is_highlight', 'is_sport',
-] + PRICING_FIELDS
+] + PRICING_FIELDS + ['pricing_checked']
 
 
 class DatabaseManager:
@@ -409,9 +409,11 @@ class DatabaseManager:
                 if not ep_data.get('id'):
                     ep_data['id'] = str(uuid.uuid4())
 
+                # See the matching comment in bulk_upsert_movies -- same
+                # rationale, same fix.
                 update_set = {
                     k: v for k, v in ep_data.items()
-                    if k not in immutable_fields
+                    if k not in immutable_fields and v is not None
                 }
                 update_set['last_seen'] = utcnow()
                 update_set['is_available'] = True
@@ -567,9 +569,17 @@ class DatabaseManager:
                 # Id is derived from provider:content_id, not client-supplied.
                 movie_data['id'] = f"{movie_data['provider']}:{movie_data['content_id']}"
 
+                # v is not None: on conflict, a None here means "we didn't
+                # have a value for this field this pass" (e.g. pricing
+                # fields when this item was skipped this crawl because
+                # pricing_checked was already True -- see provider_crawler
+                # ._process_item). Without this guard, an update would
+                # silently wipe out a previously-fetched value, since
+                # on_conflict_do_update(set_=...) writes every key present
+                # in the dict regardless of whether it's None.
                 update_set = {
                     k: v for k, v in movie_data.items()
-                    if k not in immutable_fields
+                    if k not in immutable_fields and v is not None
                 }
                 update_set['last_seen'] = utcnow()
                 update_set['is_available'] = True
@@ -610,6 +620,27 @@ class DatabaseManager:
                 is_available=True
             ).order_by(Movie.release_year.desc()).all()
             return [m.to_dict() for m in movies]
+
+    def get_pricing_checked_ids(self, provider: str) -> set:
+        """
+        content_ids (movies + episodes) for which a pricing detail lookup
+        has already been attempted for this provider.
+
+        Meant to be called ONCE per crawl_provider() run and kept in
+        memory for the duration of the crawl -- calling this per-item
+        instead would mean one extra DB round-trip per item on top of the
+        (already expensive) per-item detail HTTP fetch it's meant to help
+        avoid.
+        """
+        self._validate_provider(provider)
+        with self.session() as session:
+            movie_ids = session.query(Movie.content_id).filter_by(
+                provider=provider, pricing_checked=True
+            ).all()
+            episode_ids = session.query(TVEpisode.content_id).filter_by(
+                provider=provider, pricing_checked=True
+            ).all()
+            return {c for (c,) in movie_ids} | {c for (c,) in episode_ids}
 
     def mark_movies_unavailable(self, provider: str) -> int:
         self._validate_provider(provider)

@@ -196,6 +196,15 @@ class TVEpisode(Base):
     pricing_description = Column(String(500), nullable=True)
     pricing_tax_class = Column(String(50), nullable=True)
 
+    # Whether a per-item pricing detail lookup has been attempted for this
+    # item. This is DELIBERATELY separate from whether pricing_access_type
+    # ended up non-null -- plenty of legitimately free/AVOD items will have
+    # pricing_access_type stay None after a successful check. Without this
+    # flag there's no way to distinguish "checked, genuinely no pricing"
+    # from "never checked yet", which is what the crawler needs to decide
+    # whether to spend an extra detail-fetch request on this item.
+    pricing_checked = Column(Boolean, nullable=False, default=False, server_default="0")
+
     # Status
     first_seen = Column(DateTime, default=utcnow)
     last_seen = Column(DateTime, default=utcnow, onupdate=utcnow)
@@ -266,6 +275,7 @@ class TVEpisode(Base):
             "pricing_preview_minutes": self.pricing_preview_minutes,
             "pricing_description": self.pricing_description,
             "pricing_tax_class": self.pricing_tax_class,
+            "pricing_checked": self.pricing_checked,
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
             "is_available": self.is_available,
@@ -342,6 +352,9 @@ class Movie(Base):
     pricing_description = Column(String(500), nullable=True)
     pricing_tax_class = Column(String(50), nullable=True)
 
+    # See TVEpisode.pricing_checked docstring -- same rationale here.
+    pricing_checked = Column(Boolean, nullable=False, default=False, server_default="0")
+
     # Status
     first_seen = Column(DateTime, default=utcnow)
     last_seen = Column(DateTime, default=utcnow, onupdate=utcnow)
@@ -409,6 +422,7 @@ class Movie(Base):
             "pricing_preview_minutes": self.pricing_preview_minutes,
             "pricing_description": self.pricing_description,
             "pricing_tax_class": self.pricing_tax_class,
+            "pricing_checked": self.pricing_checked,
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
             "is_available": self.is_available,
