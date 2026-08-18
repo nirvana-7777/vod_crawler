@@ -225,6 +225,9 @@ class ProviderCrawler:
         # Build common metadata from entry
         metadata = self._extract_metadata(entry)
 
+        # Real series title, if the detail fetch can supply one.
+        detail_series_title: Optional[str] = None
+
         # Category/listing responses (what we're given here) don't carry
         # the full Pricing object -- only a dedicated per-item detail
         # fetch (GET /vod/{content_id}) does. Only pay for that fetch once
@@ -242,10 +245,18 @@ class ProviderCrawler:
                 detail = None
 
             if detail and detail.get("entries"):
-                pricing = self._extract_pricing(detail["entries"][0])
+                detail_entry = detail["entries"][0]
+                pricing = self._extract_pricing(detail_entry)
                 metadata.update(pricing)
                 metadata["pricing_checked"] = True
                 self._pricing_checked_ids.add(content_id)
+
+                # The per-item detail response is the only place with the real
+                # series title -- take it while we have the response in hand.
+                candidate = detail_entry.get("series_title") or detail_entry.get("SeriesTitle")
+                item_name = detail_entry.get("name") or detail_entry.get("Name")
+                if candidate and candidate != item_name:
+                    detail_series_title = candidate
             else:
                 # Don't mark as checked on failure/empty response -- leave
                 # it to be retried on the next crawl rather than silently
@@ -267,9 +278,10 @@ class ProviderCrawler:
 
         elif result.content_type == ContentType.TV_EPISODE:
             # Get or create show using the DB manager (handles session lifecycle)
+            series_title = detail_series_title or result.series_title or name
             show_id = self._get_or_create_show(
                 provider=provider,
-                series_title=result.series_title or name,
+                series_title=series_title,
                 series_id=result.series_id,
                 parent_content_id=parent_content_id,
                 entry=entry
@@ -296,7 +308,7 @@ class ProviderCrawler:
                     "season_number": result.season_number or 0,
                     "episode_number": result.episode_number or 0,
                     "title": name,
-                    "series_title": result.series_title or name,
+                    "series_title": series_title,
                     **episode_only_metadata
                 }
                 self.episode_buffer.append(episode_data)
